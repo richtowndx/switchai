@@ -7,6 +7,7 @@ import (
 	"sort"
 	"switchai/appdata"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,34 +25,62 @@ type Provider struct {
 	Name           string `json:"name"`
 	BaseURL        string `json:"base_url"`
 	APIKey         string `json:"api_key"`
-	Model          string `json:"model"`
+	Model          string `json:"model"`         // 兼容旧字段
+	DefaultModel   string `json:"default_model"` // 默认模型
+	HaikuModel     string `json:"haiku_model"`   // Haiku 模型
+	SonnetModel    string `json:"sonnet_model"`  // Sonnet 模型
+	OpusModel      string `json:"opus_model"`    // Opus 模型
+	FastModel      string `json:"fast_model"`    // Fast 模型
 	IsActive       bool   `json:"is_active"`
 	CreatedAt      string `json:"created_at"`
 	Order          int    `json:"order"`
 	IsOpenAIFormat bool   `json:"is_openai_format"` // 标识是否为 OpenAI 格式的 API
 }
 
+// ResolveModel 根据传入的模型键名查找供应商对应的实际模型名
+func (p *Provider) ResolveModel(incomingModel string) string {
+	m := map[string]string{
+		"default_model": p.DefaultModel,
+		"haiku_model":   p.HaikuModel,
+		"sonnet_model":  p.SonnetModel,
+		"opus_model":    p.OpusModel,
+		"fast_model":    p.FastModel,
+	}
+	if actual, ok := m[incomingModel]; ok && actual != "" {
+		return actual
+	}
+	// 兜底: default_model
+	if p.DefaultModel != "" {
+		return p.DefaultModel
+	}
+	// 兼容旧字段 Model
+	if p.Model != "" {
+		return p.Model
+	}
+	return incomingModel
+}
+
 type ServerKey struct {
-	ID               string  `json:"id"`        // 密钥ID
-	Key              string  `json:"key"`        // 密钥值 sk-xxxx
-	Remark           string  `json:"remark"`     // 备注
-	IsEnabled        bool    `json:"is_enabled"` // 是否启用
-	CreatedAt        string  `json:"created_at"` // 创建时间
-	Order            int     `json:"order"`      // 排序序号
-	DailyReqLimit    int     `json:"daily_req_limit"`    // 每日请求次数限额 (0=不限)
-	TotalReqLimit    int     `json:"total_req_limit"`    // 总请求次数限额 (0=不限)
-	DailyCostLimit   float64 `json:"daily_cost_limit"`   // 每日花费限额 (0=不限)
-	TotalCostLimit   float64 `json:"total_cost_limit"`   // 总花费限额 (0=不限)
+	ID             string  `json:"id"`               // 密钥ID
+	Key            string  `json:"key"`              // 密钥值 sk-xxxx
+	Remark         string  `json:"remark"`           // 备注
+	IsEnabled      bool    `json:"is_enabled"`       // 是否启用
+	CreatedAt      string  `json:"created_at"`       // 创建时间
+	Order          int     `json:"order"`            // 排序序号
+	DailyReqLimit  int     `json:"daily_req_limit"`  // 每日请求次数限额 (0=不限)
+	TotalReqLimit  int     `json:"total_req_limit"`  // 总请求次数限额 (0=不限)
+	DailyCostLimit float64 `json:"daily_cost_limit"` // 每日花费限额 (0=不限)
+	TotalCostLimit float64 `json:"total_cost_limit"` // 总花费限额 (0=不限)
 }
 
 type Config struct {
-	Providers      []Provider            `json:"providers"`
-	ServerKeys     []ServerKey           `json:"server_keys"` // 服务器密钥列表
-	ActiveProvider string                `json:"active_provider"`
-	TOTPSecret     string               `json:"totp_secret"`     // TOTP 2FA 密钥
-	TOTPEnabled    bool                 `json:"totp_enabled"`    // 是否已启用 2FA
-	SessionTokens  []SessionTokenEntry  `json:"session_tokens"`   // 多端登录的会话 token 列表
-	SkipAuth       bool                 `json:"skip_auth"`        // 跳过认证（内网部署）
+	Providers      []Provider          `json:"providers"`
+	ServerKeys     []ServerKey         `json:"server_keys"` // 服务器密钥列表
+	ActiveProvider string              `json:"active_provider"`
+	TOTPSecret     string              `json:"totp_secret"`    // TOTP 2FA 密钥
+	TOTPEnabled    bool                `json:"totp_enabled"`   // 是否已启用 2FA
+	SessionTokens  []SessionTokenEntry `json:"session_tokens"` // 多端登录的会话 token 列表
+	SkipAuth       bool                `json:"skip_auth"`      // 跳过认证（内网部署）
 	mu             sync.RWMutex
 }
 
@@ -115,7 +144,12 @@ func initDB() error {
 		is_active INTEGER,
 		created_at TEXT,
 		order_num INTEGER,
-		is_openai_format INTEGER DEFAULT 0
+		is_openai_format INTEGER DEFAULT 0,
+		default_model TEXT DEFAULT '',
+		haiku_model TEXT DEFAULT '',
+		sonnet_model TEXT DEFAULT '',
+		opus_model TEXT DEFAULT '',
+		fast_model TEXT DEFAULT ''
 	);
 	CREATE TABLE IF NOT EXISTS server_keys (
 		id TEXT PRIMARY KEY,
@@ -137,6 +171,11 @@ func initDB() error {
 
 	// 迁移：添加 is_openai_format 列（如果不存在）
 	db.Exec("ALTER TABLE providers ADD COLUMN is_openai_format INTEGER DEFAULT 0")
+	db.Exec("ALTER TABLE providers ADD COLUMN default_model TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE providers ADD COLUMN haiku_model TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE providers ADD COLUMN sonnet_model TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE providers ADD COLUMN opus_model TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE providers ADD COLUMN fast_model TEXT DEFAULT ''")
 
 	return nil
 }
@@ -187,7 +226,7 @@ func (c *Config) Load() error {
 	}
 
 	// 加载 providers
-	rows, err := db.Query("SELECT id, name, base_url, api_key, model, is_active, created_at, order_num, COALESCE(is_openai_format, 0) FROM providers ORDER BY order_num")
+	rows, err := db.Query("SELECT id, name, base_url, api_key, model, is_active, created_at, order_num, COALESCE(is_openai_format, 0), COALESCE(default_model, ''), COALESCE(haiku_model, ''), COALESCE(sonnet_model, ''), COALESCE(opus_model, ''), COALESCE(fast_model, '') FROM providers ORDER BY order_num")
 	if err != nil {
 		return err
 	}
@@ -198,7 +237,7 @@ func (c *Config) Load() error {
 		var p Provider
 		var isActive int
 		var isOpenAIFormat int
-		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &p.APIKey, &p.Model, &isActive, &p.CreatedAt, &p.Order, &isOpenAIFormat); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &p.APIKey, &p.Model, &isActive, &p.CreatedAt, &p.Order, &isOpenAIFormat, &p.DefaultModel, &p.HaikuModel, &p.SonnetModel, &p.OpusModel, &p.FastModel); err != nil {
 			return err
 		}
 		p.IsActive = isActive == 1
@@ -278,8 +317,8 @@ func (c *Config) save() error {
 		if p.IsOpenAIFormat {
 			isOpenAIFormat = 1
 		}
-		_, err = db.Exec("INSERT INTO providers (id, name, base_url, api_key, model, is_active, created_at, order_num, is_openai_format) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			p.ID, p.Name, p.BaseURL, p.APIKey, p.Model, isActive, p.CreatedAt, p.Order, isOpenAIFormat)
+		_, err = db.Exec("INSERT INTO providers (id, name, base_url, api_key, model, is_active, created_at, order_num, is_openai_format, default_model, haiku_model, sonnet_model, opus_model, fast_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			p.ID, p.Name, p.BaseURL, p.APIKey, p.Model, isActive, p.CreatedAt, p.Order, isOpenAIFormat, p.DefaultModel, p.HaikuModel, p.SonnetModel, p.OpusModel, p.FastModel)
 		if err != nil {
 			return err
 		}
@@ -340,26 +379,49 @@ func (c *Config) GetProviderByID(id string) *Provider {
 	return nil
 }
 
-// GetProviderByFormat 根据API格式获取提供商，优先返回激活的提供商
+// round-robin 轮询计数器
+var roundRobinCounter uint64
+
+// GetNextProvider 轮询方式获取下一个匹配格式的提供商
+func (c *Config) GetNextProvider(isOpenAIFormat bool) *Provider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var matching []int
+	for i := range c.Providers {
+		if c.Providers[i].IsOpenAIFormat == isOpenAIFormat {
+			matching = append(matching, i)
+		}
+	}
+
+	if len(matching) == 0 && isOpenAIFormat {
+		for i := range c.Providers {
+			if c.Providers[i].ID == c.ActiveProvider {
+				return &c.Providers[i]
+			}
+		}
+		if len(c.Providers) > 0 {
+			return &c.Providers[0]
+		}
+		return nil
+	}
+
+	n := atomic.AddUint64(&roundRobinCounter, 1)
+	idx := matching[int(n-1)%len(matching)]
+	return &c.Providers[idx]
+}
+
+// GetProviderByFormat 获取匹配格式的第一个提供商（兼容旧调用）
 func (c *Config) GetProviderByFormat(isOpenAIFormat bool) *Provider {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	// 优先返回激活的且格式匹配的提供商
-	for i := range c.Providers {
-		if c.Providers[i].ID == c.ActiveProvider && c.Providers[i].IsOpenAIFormat == isOpenAIFormat {
-			return &c.Providers[i]
-		}
-	}
-
-	// 否则返回第一个格式匹配的提供商
 	for i := range c.Providers {
 		if c.Providers[i].IsOpenAIFormat == isOpenAIFormat {
 			return &c.Providers[i]
 		}
 	}
 
-	// 没有找到匹配格式的提供商，返回活跃提供商（可能格式不匹配）
 	return c.GetActiveProvider()
 }
 

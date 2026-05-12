@@ -21,112 +21,33 @@ import (
 	"github.com/google/uuid"
 )
 
+const maxProviderRetries = 3
+
 func RegisterRoutes(r *gin.Engine) {
-	// 代理所有 /v1/* 路径
 	r.Any("/v1/*path", proxyHandler)
 }
 
-// doRequestWithRetry 执行请求并在遇到 "try again" 错误时自动重试
-func doRequestWithRetry(req *http.Request, bodyBytes []byte, provider *config.Provider, maxRetries int) (*http.Response, error) {
-	var lastResp *http.Response
-	var lastErr error
+// ============================================================
+// 认证 & 鉴权
+// ============================================================
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		// 为每次重试创建新的请求体 reader
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			lastErr = err
-			if attempt < maxRetries {
-				logger.Info("⚠️ 请求失败 (尝试 %d/%d): %v，准备重试...", attempt, maxRetries, err)
-				time.Sleep(time.Duration(attempt) * time.Second) // 递增延迟
-				continue
-			}
-			return nil, err
-		}
-
-		// 读取响应体以检查是否包含 "try again" 错误
-		respBody, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			if attempt < maxRetries {
-				logger.Info("⚠️ 读取响应失败 (尝试 %d/%d): %v，准备重试...", attempt, maxRetries, err)
-				time.Sleep(time.Duration(attempt) * time.Second)
-				continue
-			}
-			return nil, err
-		}
-
-		// 检查响应是否包含需要重试的错误
-		shouldRetry := false
-		if resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 529 {
-			var errorResp map[string]interface{}
-			if json.Valid(respBody) && json.Unmarshal(respBody, &errorResp) == nil {
-				if errorObj, ok := errorResp["error"].(map[string]interface{}); ok {
-					// 检查 error type
-					if errorType, ok := errorObj["type"].(string); ok {
-						if errorType == "overloaded_error" || errorType == "rate_limit_error" {
-							shouldRetry = true
-						}
-					}
-					// 检查错误消息
-					if message, ok := errorObj["message"].(string); ok {
-						lowerMsg := strings.ToLower(message)
-						if strings.Contains(lowerMsg, "try again") ||
-							strings.Contains(lowerMsg, "high traffic") ||
-							strings.Contains(lowerMsg, "overloaded") ||
-							strings.Contains(lowerMsg, "负载较高") {
-							shouldRetry = true
-						}
-					}
-				}
-			}
-		}
-
-		// 如果需要重试且还有重试次数
-		if shouldRetry && attempt < maxRetries {
-			logger.Info("⚠️ 检测到需重试错误 (尝试 %d/%d)：status=%d, type=overloaded_error，准备重试...", attempt, maxRetries, resp.StatusCode)
-			time.Sleep(time.Duration(attempt) * time.Second) // 递增延迟
-			continue
-		}
-
-		// 成功或不需要重试，重新包装响应体并返回
-		resp.Body = io.NopCloser(bytes.NewReader(respBody))
-		if shouldRetry && attempt == maxRetries {
-			logger.Info("❌ 重试 %d 次后仍然失败，终止重试", maxRetries)
-		} else if attempt > 1 {
-			logger.Info("✅ 重试成功 (尝试 %d/%d)", attempt, maxRetries)
-		}
-		return resp, nil
-	}
-
-	return lastResp, lastErr
-}
-
-func proxyHandler(c *gin.Context) {
-	startTime := time.Now()
-	requestID := uuid.New().String()
-
-	// 验证服务器密钥
+// authenticate 验证请求的 Authorization 头，返回 (keyID, clientIP, ok)
+func authenticate(c *gin.Context) (string, string, bool) {
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing authorization header"})
-		return
+		return "", "", false
 	}
 
-	// 支持 "Bearer sk-xxxx" 或 "sk-xxxx" 格式
 	providedKey := authHeader
 	if strings.HasPrefix(authHeader, "Bearer ") {
 		providedKey = strings.TrimPrefix(authHeader, "Bearer ")
 	}
 
-	// 验证密钥并获取密钥ID
 	keyID, isValid := config.GetConfig().ValidateServerKey(providedKey)
 	if !isValid {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or disabled server key"})
-		return
+		return "", "", false
 	}
 
 	// 检查密钥限额
@@ -137,166 +58,263 @@ func proxyHandler(c *gin.Context) {
 			serverKey.DailyCostLimit, serverKey.TotalCostLimit)
 		if !allowed {
 			c.JSON(http.StatusForbidden, gin.H{"error": reason})
-			return
+			return "", "", false
 		}
 	}
 
-	// 检测请求格式：Anthropic 使用 /v1/messages，OpenAI 使用 /v1/chat/completions
-	isIncomingOpenAIFormat := strings.HasPrefix(c.Request.URL.Path, "/v1/chat")
+	return keyID, c.ClientIP(), true
+}
 
-	// 根据请求格式选择对应的提供商，而不是总是使用活跃的提供商
-	provider := config.GetConfig().GetProviderByFormat(isIncomingOpenAIFormat)
-	if provider == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "No active provider configured",
-		})
-		return
+// ============================================================
+// 目标 URL 构建
+// ============================================================
+
+// buildTargetURL 根据供应商 BaseURL 和请求路径构建上游目标 URL
+func buildTargetURL(provider *config.Provider, reqPath, rawQuery string) string {
+	base := provider.BaseURL
+	if strings.Contains(base, "/v1/") || strings.HasSuffix(base, "/v1") {
+		idx := strings.Index(base, "/v1")
+		return base[:idx] + reqPath + querySuffix(rawQuery)
 	}
+	return strings.TrimSuffix(base, "/") + reqPath + querySuffix(rawQuery)
+}
 
-	clientIP := c.ClientIP()
-
-	// 构建目标 URL
-	// 如果 BaseURL 已经是完整路径（包含 /v1/），只替换路径部分；否则拼接路径
-	targetURL := provider.BaseURL
-	if strings.Contains(targetURL, "/v1/") {
-		// BaseURL 包含 /v1/，可能是完整路径，需要替换掉后面的部分
-		idx := strings.Index(targetURL, "/v1/")
-		targetURL = targetURL[:idx] + c.Request.URL.Path
-		if c.Request.URL.RawQuery != "" {
-			targetURL += "?" + c.Request.URL.RawQuery
+// buildTargetURLForConversion 为格式转换场景构建目标 URL
+func buildTargetURLForConversion(provider *config.Provider, isOpenAIFormat bool) string {
+	base := strings.TrimSuffix(provider.BaseURL, "/")
+	if isOpenAIFormat {
+		// OpenAI 格式 → /chat/completions
+		if strings.HasSuffix(base, "/v1") {
+			return base + "/chat/completions"
 		}
-	} else {
-		// BaseURL 不包含 /v1/，正常拼接
-		targetURL = strings.TrimSuffix(targetURL, "/") + c.Request.URL.Path
-		if c.Request.URL.RawQuery != "" {
-			targetURL += "?" + c.Request.URL.RawQuery
-		}
+		return base + "/v1/chat/completions"
 	}
-	logger.Info("📡 代理转发 - Provider: %s, BaseURL: %s, Path: %s → Target: %s", provider.Name, provider.BaseURL, c.Request.URL.Path, targetURL)
+	// Anthropic 格式 → /v1/messages
+	if strings.HasSuffix(base, "/v1") {
+		return base + "/messages"
+	}
+	return base + "/v1/messages"
+}
 
-	// 读取请求体
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
-		return
+func querySuffix(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	return "?" + rawQuery
+}
+
+// ============================================================
+// 请求体处理
+// ============================================================
+
+// processRequestResult 保存请求体处理结果
+type processRequestResult struct {
+	BodyBytes           []byte
+	ModifiedRequestBody string
+	RequestedModel      string
+	IsStream            bool
+	TargetURL           string
+}
+
+// processRequestBody 解析请求体、解析模型名、执行格式转换
+func processRequestBody(bodyBytes []byte, provider *config.Provider, isIncomingOpenAIFormat bool, reqPath, rawQuery string) (*processRequestResult, error) {
+	result := &processRequestResult{
+		BodyBytes:           bodyBytes,
+		ModifiedRequestBody: string(bodyBytes),
+		RequestedModel:      "unknown",
+		TargetURL:           buildTargetURL(provider, reqPath, rawQuery),
 	}
 
-	// 解析请求体以检查是否为流式请求，并替换模型参数
+	if len(bodyBytes) == 0 || !json.Valid(bodyBytes) {
+		return result, nil
+	}
+
 	var requestBody map[string]interface{}
-	isStream := false
-	requestedModel := "unknown"
-	modifiedRequestBody := string(bodyBytes) // 用于历史记录的请求体
+	if err := json.Unmarshal(bodyBytes, &requestBody); err != nil {
+		return result, nil
+	}
 
-	if len(bodyBytes) > 0 && json.Valid(bodyBytes) {
-		if err := json.Unmarshal(bodyBytes, &requestBody); err == nil {
-			// 检查是否为流式请求
-			if stream, ok := requestBody["stream"].(bool); ok && stream {
-				isStream = true
-			}
+	// 检测流式
+	if stream, ok := requestBody["stream"].(bool); ok && stream {
+		result.IsStream = true
+	}
 
-			// 获取请求的模型名称
-			if model, ok := requestBody["model"].(string); ok {
-				requestedModel = model
-				logger.Info("Original request model: %s", model)
+	// 模型解析：用传入的模型名去查 provider 的模型映射表
+	if model, ok := requestBody["model"].(string); ok {
+		result.RequestedModel = model
+		resolved := provider.ResolveModel(model)
+		logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, provider.Name)
+		requestBody["model"] = resolved
+		result.RequestedModel = resolved
+	}
 
-				// 使用供应商配置的模型替换请求中的模型
-				if provider.Model != "" {
-					requestBody["model"] = provider.Model
-					requestedModel = provider.Model
-					logger.Info("Replaced with provider model: %s", provider.Model)
-				}
-			}
-
-			// 自动格式转换：如果请求格式与提供商格式不匹配，需要转换
-			if provider.IsOpenAIFormat && !isIncomingOpenAIFormat {
-				// 请求是 Anthropic 格式，但提供商是 OpenAI 格式，需要转换
-				logger.Info("Converting Anthropic request to OpenAI format")
-				requestBody = convertClaudeToOpenAI(requestBody)
-				// 智能构建 URL，避免路径重复
-				baseURL := strings.TrimSuffix(provider.BaseURL, "/")
-				if strings.HasSuffix(baseURL, "/v1") {
-					targetURL = baseURL + "/chat/completions"
-				} else {
-					targetURL = baseURL + "/v1/chat/completions"
-				}
-			} else if !provider.IsOpenAIFormat && isIncomingOpenAIFormat {
-				// 请求是 OpenAI 格式，但提供商是 Anthropic 格式，需要转换
-				logger.Info("Converting OpenAI request to Anthropic format")
-				requestBody = convertOpenAIToClaudeRequest(requestBody)
-				targetURL = strings.TrimSuffix(provider.BaseURL, "/") + "/v1/messages"
-			} else if provider.IsOpenAIFormat && isIncomingOpenAIFormat {
-				// 已经是 OpenAI 格式但提供商是 OpenAI 格式
-				baseURL := strings.TrimSuffix(provider.BaseURL, "/")
-				if strings.HasSuffix(baseURL, "/v1") {
-					targetURL = baseURL + "/chat/completions"
-				} else {
-					targetURL = baseURL + "/v1/chat/completions"
-				}
-			}
-			// else: 非 OpenAI 格式，保持原 targetURL
-
-			// 重新序列化请求体
-			bodyBytes, _ = json.Marshal(requestBody)
-			modifiedRequestBody = string(bodyBytes) // 保存修改后的请求体用于历史记录
+	// 格式转换
+	needsConversion := provider.IsOpenAIFormat != isIncomingOpenAIFormat
+	if needsConversion {
+		if provider.IsOpenAIFormat && !isIncomingOpenAIFormat {
+			logger.Info("Converting Anthropic request to OpenAI format")
+			requestBody = convertClaudeToOpenAI(requestBody)
+			result.TargetURL = buildTargetURLForConversion(provider, true)
+		} else if !provider.IsOpenAIFormat && isIncomingOpenAIFormat {
+			logger.Info("Converting OpenAI request to Anthropic format")
+			requestBody = convertOpenAIToClaudeRequest(requestBody)
+			result.TargetURL = buildTargetURLForConversion(provider, false)
 		}
+	} else if provider.IsOpenAIFormat && isIncomingOpenAIFormat {
+		result.TargetURL = buildTargetURLForConversion(provider, true)
 	}
 
-	// 创建新请求
-	req, err := http.NewRequest(c.Request.Method, targetURL, bytes.NewReader(bodyBytes))
+	// 重新序列化
+	serialized, _ := json.Marshal(requestBody)
+	result.BodyBytes = serialized
+	result.ModifiedRequestBody = string(serialized)
+	return result, nil
+}
+
+// ============================================================
+// 上游请求
+// ============================================================
+
+// sendRequest 发送单次请求到上游，返回响应（不做重试）
+func sendRequest(method, targetURL string, originalHeaders http.Header, bodyBytes []byte, provider *config.Provider) (*http.Response, error) {
+	req, err := http.NewRequest(method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
-		return
+		return nil, err
 	}
 
-	// 复制请求头，但替换 API Key
-	for key, values := range c.Request.Header {
+	// 复制请求头（跳过原始 Authorization）
+	for key, values := range originalHeaders {
 		if key == "Authorization" {
-			continue // 跳过原始的 Authorization
+			continue
 		}
 		for _, value := range values {
 			req.Header.Add(key, value)
 		}
 	}
 
-	// 设置正确的 API Key
+	// 设置供应商的 API Key
 	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	// 发送请求，带重试机制
-	resp, err := doRequestWithRetry(req, bodyBytes, provider, 3)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		logger.Error("❌ Proxy error after retries: %v", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to proxy request after retries"})
-		return
-	}
-	defer resp.Body.Close()
-
-	logger.Info("📥 收到目标服务器响应 - Status: %d, Content-Type: %s, Content-Encoding: %s",
-		resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"))
-
-	// 复制响应头，但跳过编码相关的头
-	// Go 的 http.Client 会自动解压 gzip，所以不应该转发 Content-Encoding
-	for key, values := range resp.Header {
-		// 跳过这些头，因为内容已经被自动解压或长度会改变
-		if key == "Content-Encoding" || key == "Content-Length" {
-			continue
-		}
-		for _, value := range values {
-			c.Header(key, value)
-		}
+		return nil, err
 	}
 
-	// 处理流式响应
-	if isStream {
-		handleStreamResponse(c, resp, provider, requestID, startTime, c.Request.Method, c.Request.URL.Path, modifiedRequestBody, c.Request.Header, requestedModel, keyID, clientIP, isIncomingOpenAIFormat)
-		return
+	// 检查是否为可重试的服务端错误
+	if isRetryableError(resp) {
+		resp.Body.Close()
+		return nil, &retryableError{StatusCode: resp.StatusCode}
 	}
 
-	// 处理非流式响应
-	handleNonStreamResponse(c, resp, provider, requestID, startTime, c.Request.Method, c.Request.URL.Path, modifiedRequestBody, c.Request.Header, requestedModel, keyID, clientIP, isIncomingOpenAIFormat)
+	return resp, nil
 }
 
-// handleStreamResponse 处理流式响应（SSE）
+// retryableError 表示可重试的上游错误（换 provider 重试）
+type retryableError struct {
+	StatusCode int
+}
+
+func (e *retryableError) Error() string {
+	return "upstream returned retryable error"
+}
+
+// isRetryableError 判断响应是否为可重试的服务端错误
+func isRetryableError(resp *http.Response) bool {
+	if resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 529 {
+		return true
+	}
+	return false
+}
+
+// ============================================================
+// 主入口：proxyHandler
+// ============================================================
+
+func proxyHandler(c *gin.Context) {
+	startTime := time.Now()
+	requestID := uuid.New().String()
+
+	// 1. 认证
+	keyID, clientIP, ok := authenticate(c)
+	if !ok {
+		return
+	}
+
+	// 2. 检测请求格式
+	isIncomingOpenAIFormat := strings.HasPrefix(c.Request.URL.Path, "/v1/chat")
+
+	// 3. 读取请求体
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
+		return
+	}
+
+	// 4. 轮询重试：最多尝试 maxProviderRetries 个不同 provider
+	var lastErr error
+	for attempt := 0; attempt < maxProviderRetries; attempt++ {
+		provider := config.GetConfig().GetNextProvider(isIncomingOpenAIFormat)
+		if provider == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No provider configured"})
+			return
+		}
+
+		logger.Info("📡 Provider attempt %d/%d: %s (format: isOpenAI=%v)",
+			attempt+1, maxProviderRetries, provider.Name, provider.IsOpenAIFormat)
+
+		// 处理请求体（模型解析 + 格式转换）
+		processed, err := processRequestBody(bodyBytes, provider, isIncomingOpenAIFormat,
+			c.Request.URL.Path, c.Request.URL.RawQuery)
+		if err != nil {
+			logger.Error("❌ Failed to process request body: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process request"})
+			return
+		}
+
+		logger.Info("📡 代理转发 - Provider: %s, BaseURL: %s → Target: %s",
+			provider.Name, provider.BaseURL, processed.TargetURL)
+
+		// 发送请求到上游
+		resp, err := sendRequest(c.Request.Method, processed.TargetURL,
+			c.Request.Header, processed.BodyBytes, provider)
+		if err != nil {
+			lastErr = err
+			if _, ok := err.(*retryableError); ok {
+				logger.Info("⚠️ Provider %s 返回可重试错误 (attempt %d/%d)，尝试下一个 provider",
+					provider.Name, attempt+1, maxProviderRetries)
+				continue
+			}
+			logger.Error("❌ Provider %s 连接失败: %v", provider.Name, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		logger.Info("📥 收到响应 - Provider: %s, Status: %d, Content-Type: %s",
+			provider.Name, resp.StatusCode, resp.Header.Get("Content-Type"))
+
+		// 5. 处理响应
+		if processed.IsStream {
+			handleStreamResponse(c, resp, provider, requestID, startTime,
+				c.Request.Method, c.Request.URL.Path, processed.ModifiedRequestBody,
+				c.Request.Header, processed.RequestedModel, keyID, clientIP, isIncomingOpenAIFormat)
+		} else {
+			handleNonStreamResponse(c, resp, provider, requestID, startTime,
+				c.Request.Method, c.Request.URL.Path, processed.ModifiedRequestBody,
+				c.Request.Header, processed.RequestedModel, keyID, clientIP, isIncomingOpenAIFormat)
+		}
+		return
+	}
+
+	// 所有 provider 都失败
+	logger.Error("❌ 所有 provider 均失败 (尝试 %d 次): %v", maxProviderRetries, lastErr)
+	c.JSON(http.StatusBadGateway, gin.H{"error": "All providers failed after retries"})
+}
+
+// ============================================================
+// 流式响应处理
+// ============================================================
+
 func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.Provider, requestID string, startTime time.Time, method, path, requestBody string, requestHeaders http.Header, requestedModel string, keyID, clientIP string, isIncomingOpenAIFormat bool) {
 	var firstTokenTime time.Time
 
@@ -312,7 +330,6 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 		return
 	}
 
-	// 根据 Content-Encoding 处理解压
 	var reader io.Reader = resp.Body
 	contentEncoding := resp.Header.Get("Content-Encoding")
 	if contentEncoding != "" && contentEncoding != "identity" {
@@ -332,22 +349,17 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 	var model string
 	firstToken := true
 	var responseBody strings.Builder
+	needsConversion := provider.IsOpenAIFormat != isIncomingOpenAIFormat
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
 
-		// 如果请求格式与提供商格式不匹配，需要转换响应
-		// provider.IsOpenAIFormat == isIncomingOpenAIFormat: 格式匹配，直接转发
-		// provider.IsOpenAIFormat && !isIncomingOpenAIFormat: 请求是Anthropic转OpenAI，响应是OpenAI，需转Claude
-		// !provider.IsOpenAIFormat && isIncomingOpenAIFormat: 请求是OpenAI转Anthropic，响应是Anthropic，需转OpenAI
-		needsConversion := provider.IsOpenAIFormat != isIncomingOpenAIFormat
-
 		if needsConversion && provider.IsOpenAIFormat {
+			// OpenAI SSE → Claude SSE
 			lineStr := string(line)
 			if strings.HasPrefix(lineStr, "data: ") {
 				data := strings.TrimPrefix(lineStr, "data: ")
 				if data == "[DONE]" {
-					// 转换为 Claude 格式的结束标记
 					claudeDone := "data: {\"type\":\"message_stop\"}\n\n"
 					if _, err := c.Writer.Write([]byte(claudeDone)); err != nil {
 						return
@@ -356,25 +368,17 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 					responseBody.WriteString(claudeDone)
 					continue
 				}
-
 				var openaiChunk map[string]interface{}
 				if err := json.Unmarshal([]byte(data), &openaiChunk); err == nil {
-					// 提取模型信息
 					if m, ok := openaiChunk["model"].(string); ok && m != "" {
 						model = m
 					}
-
-					// 转换为 Claude 格式的流式响应
 					claudeChunk := convertOpenAIStreamToClaude(openaiChunk)
 					if claudeData, err := json.Marshal(claudeChunk); err == nil {
 						claudeLine := "data: " + string(claudeData) + "\n\n"
-						if _, err := c.Writer.Write([]byte(claudeLine)); err != nil {
-							return
-						}
+						c.Writer.Write([]byte(claudeLine))
 						flusher.Flush()
 						responseBody.WriteString(claudeLine)
-
-						// 提取 usage 信息
 						if usage, ok := claudeChunk["usage"].(map[string]interface{}); ok {
 							if input, ok := usage["input_tokens"].(int); ok {
 								inputTokens = input
@@ -383,57 +387,38 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 								outputTokens = output
 							}
 						}
-					} else {
-						logger.Error("❌ Claude chunk JSON 序列化失败: %v, chunk: %+v", err, claudeChunk)
 					}
-				} else {
-					logger.Error("❌ OpenAI chunk JSON 解析失败: %v, 原始数据: %s", err, data)
 				}
 			} else {
-				// 非 data 行直接转发
-				if _, err := c.Writer.Write(line); err != nil {
-					return
-				}
-				if _, err := c.Writer.Write([]byte("\n")); err != nil {
-					return
-				}
+				c.Writer.Write(line)
+				c.Writer.Write([]byte("\n"))
 				flusher.Flush()
 				responseBody.Write(line)
 				responseBody.WriteString("\n")
 			}
 		} else if needsConversion {
-			// Anthropic 响应需要转换为 OpenAI 格式 (请求是 OpenAI 格式被转换为 Anthropic)
+			// Claude SSE → OpenAI SSE
 			lineStr := string(line)
 			if strings.HasPrefix(lineStr, "data: ") {
 				data := strings.TrimPrefix(lineStr, "data: ")
 				if data == "[DONE]" {
 					openaiDone := "data: [DONE]\n\n"
-					if _, err := c.Writer.Write([]byte(openaiDone)); err != nil {
-						return
-					}
+					c.Writer.Write([]byte(openaiDone))
 					flusher.Flush()
 					responseBody.WriteString(openaiDone)
 					continue
 				}
-
 				var claudeChunk map[string]interface{}
 				if err := json.Unmarshal([]byte(data), &claudeChunk); err == nil {
-					// 提取模型信息
 					if m, ok := claudeChunk["model"].(string); ok && m != "" {
 						model = m
 					}
-
-					// 转换为 OpenAI 格式的流式响应
 					openaiChunk := convertClaudeStreamToOpenAI(claudeChunk)
 					if openaiData, err := json.Marshal(openaiChunk); err == nil {
 						openaiLine := "data: " + string(openaiData) + "\n\n"
-						if _, err := c.Writer.Write([]byte(openaiLine)); err != nil {
-							return
-						}
+						c.Writer.Write([]byte(openaiLine))
 						flusher.Flush()
 						responseBody.WriteString(openaiLine)
-
-						// 提取 usage 信息
 						if usage, ok := claudeChunk["usage"].(map[string]interface{}); ok {
 							if input, ok := usage["input_tokens"].(float64); ok {
 								inputTokens = int(input)
@@ -445,28 +430,17 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 					}
 				}
 			} else {
-				// 非 data 行直接转发
-				if _, err := c.Writer.Write(line); err != nil {
-					return
-				}
-				if _, err := c.Writer.Write([]byte("\n")); err != nil {
-					return
-				}
+				c.Writer.Write(line)
+				c.Writer.Write([]byte("\n"))
 				flusher.Flush()
 				responseBody.Write(line)
 				responseBody.WriteString("\n")
 			}
 		} else {
-			// 格式匹配，Claude 格式直接转发
-			if _, err := c.Writer.Write(line); err != nil {
-				return
-			}
-			if _, err := c.Writer.Write([]byte("\n")); err != nil {
-				return
-			}
+			// 格式匹配，直接转发
+			c.Writer.Write(line)
+			c.Writer.Write([]byte("\n"))
 			flusher.Flush()
-
-			// Collect response body
 			responseBody.Write(line)
 			responseBody.WriteString("\n")
 
@@ -476,14 +450,11 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 				if data == "[DONE]" {
 					continue
 				}
-
 				var streamData map[string]interface{}
 				if err := json.Unmarshal([]byte(data), &streamData); err == nil {
-					// 提取模型信息
 					if m, ok := streamData["model"].(string); ok && m != "" {
 						model = m
 					}
-					// 提取 usage 信息
 					if usage, ok := streamData["usage"].(map[string]interface{}); ok {
 						if input, ok := usage["input_tokens"].(float64); ok {
 							inputTokens = int(input)
@@ -503,52 +474,137 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 	}
 
 	duration := time.Since(startTime).Milliseconds()
-	timeToFirst := int64(0)
+	var timeToFirst int64
 	if !firstTokenTime.IsZero() {
 		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
 	}
-
-	// 如果响应中没有模型信息，使用请求中的模型
 	if model == "" {
 		model = requestedModel
 	}
+	if model == "" {
+		model = "unknown"
+	}
+	cost := calculateCost(model, inputTokens, outputTokens)
 
-	// 如果没有获取到模型信息，使用默认值
+	stats.RecordUsage(provider.ID, provider.Name, model, "stream", "claude", inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
+	history.AddRecord(history.RequestRecord{
+		ID: requestID, Timestamp: startTime, Method: method, Path: path,
+		ClientIP: clientIP, KeyID: keyID, Provider: provider.Name, Model: model,
+		StatusCode: resp.StatusCode, Duration: duration,
+		RequestBody: requestBody, ResponseBody: responseBody.String(),
+		RequestHeaders: requestHeaders, ResponseHeaders: resp.Header,
+		RequestSize: int64(len(requestBody)), ResponseSize: int64(responseBody.Len()),
+		InputTokens: inputTokens, OutputTokens: outputTokens,
+		TotalTokens: inputTokens + outputTokens, Cost: cost,
+	})
+}
+
+// ============================================================
+// 非流式响应处理
+// ============================================================
+
+func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *config.Provider, requestID string, startTime time.Time, method, path, requestBody string, requestHeaders http.Header, requestedModel string, keyID, clientIP string, isIncomingOpenAIFormat bool) {
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Error("❌ 读取响应体失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read response"})
+		return
+	}
+
+	logger.Info("📥 响应信息 - Status: %d, Content-Type: %s, Content-Encoding: %s, Body大小: %d",
+		resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), len(respBody))
+
+	// 解压
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	if contentEncoding != "" && contentEncoding != "identity" {
+		if decompressed, err := decompressResponse(bytes.NewReader(respBody), contentEncoding); err == nil {
+			respBody = decompressed
+		} else {
+			logger.Error("❌ 解压失败: %v, Content-Encoding: %s", err, contentEncoding)
+		}
+	}
+
+	model := requestedModel
+	var inputTokens, outputTokens int
+	var responseBodyForHistory string
+
+	if resp.StatusCode == 200 && len(respBody) > 0 {
+		var result struct {
+			Model string `json:"model"`
+			Usage struct {
+				InputTokens  int `json:"input_tokens"`
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(respBody, &result); err != nil {
+			logger.Error("❌ JSON解析失败: %v", err)
+		} else {
+			if result.Model != "" {
+				model = result.Model
+			}
+			inputTokens = result.Usage.InputTokens
+			outputTokens = result.Usage.OutputTokens
+		}
+		responseBodyForHistory = string(respBody)
+	}
+
 	if model == "" {
 		model = "unknown"
 	}
 
+	duration := time.Since(startTime).Milliseconds()
 	cost := calculateCost(model, inputTokens, outputTokens)
-
-	// 始终记录统计信息
-	stats.RecordUsage(provider.ID, provider.Name, model, "stream", "claude", inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
-
-	// Save to history
+	stats.RecordUsage(provider.ID, provider.Name, model, "non-stream", "claude",
+		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
 	history.AddRecord(history.RequestRecord{
-		ID:              requestID,
-		Timestamp:       startTime,
-		Method:          method,
-		Path:            path,
-		ClientIP:        clientIP,
-		KeyID:           keyID,
-		Provider:        provider.Name,
-		Model:           model,
-		StatusCode:      resp.StatusCode,
-		Duration:        duration,
-		RequestBody:     requestBody,
-		ResponseBody:    responseBody.String(),
-		RequestHeaders:  requestHeaders,
-		ResponseHeaders: resp.Header,
-		RequestSize:     int64(len(requestBody)),
-		ResponseSize:    int64(responseBody.Len()),
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		TotalTokens:     inputTokens + outputTokens,
-		Cost:            cost,
+		ID: requestID, Timestamp: startTime, Method: method, Path: path,
+		ClientIP: clientIP, KeyID: keyID, Provider: provider.Name, Model: model,
+		StatusCode: resp.StatusCode, Duration: duration,
+		RequestBody: requestBody, ResponseBody: responseBodyForHistory,
+		RequestHeaders: requestHeaders, ResponseHeaders: resp.Header,
+		RequestSize: int64(len(requestBody)), ResponseSize: int64(len(respBody)),
+		InputTokens: inputTokens, OutputTokens: outputTokens,
+		TotalTokens: inputTokens + outputTokens, Cost: cost,
 	})
+
+	// 格式转换（非流式）
+	needsConversion := provider.IsOpenAIFormat != isIncomingOpenAIFormat
+	if needsConversion && resp.StatusCode == 200 && len(respBody) > 0 {
+		if !provider.IsOpenAIFormat && isIncomingOpenAIFormat {
+			var claudeResp map[string]interface{}
+			if json.Unmarshal(respBody, &claudeResp) == nil {
+				openaiResp := convertClaudeToOpenAIResponse(claudeResp)
+				if converted, err := json.Marshal(openaiResp); err == nil {
+					respBody = converted
+				}
+			}
+		} else if provider.IsOpenAIFormat && !isIncomingOpenAIFormat {
+			var openaiResp map[string]interface{}
+			if json.Unmarshal(respBody, &openaiResp) == nil {
+				claudeResp := convertOpenAIToClaude(openaiResp)
+				if converted, err := json.Marshal(claudeResp); err == nil {
+					respBody = converted
+				}
+			}
+		}
+	}
+
+	// 透传
+	for key, values := range resp.Header {
+		if key == "Content-Encoding" || key == "Content-Length" {
+			continue
+		}
+		for _, value := range values {
+			c.Header(key, value)
+		}
+	}
+	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
 }
 
-// decompressResponse 根据 Content-Encoding 解压响应内容
+// ============================================================
+// 解压
+// ============================================================
+
 func decompressResponse(body io.Reader, contentEncoding string) ([]byte, error) {
 	switch strings.ToLower(contentEncoding) {
 	case "gzip":
@@ -572,138 +628,13 @@ func decompressResponse(body io.Reader, contentEncoding string) ([]byte, error) 
 	case "br":
 		return io.ReadAll(brotli.NewReader(body))
 	default:
-		// 未知的编码格式或无编码，直接返回原始内容
 		return io.ReadAll(body)
 	}
 }
 
-// handleNonStreamResponse 处理非流式响应
-func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *config.Provider, requestID string, startTime time.Time, method, path, requestBody string, requestHeaders http.Header, requestedModel string, keyID, clientIP string, isIncomingOpenAIFormat bool) {
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Error("❌ 读取响应体失败: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read response"})
-		return
-	}
-
-	// 打印响应基本信息
-	logger.Info("📥 响应信息 - Status: %d, Content-Type: %s, Content-Encoding: %s, Body大小: %d",
-		resp.StatusCode, resp.Header.Get("Content-Type"), resp.Header.Get("Content-Encoding"), len(respBody))
-
-	// 根据 Content-Encoding 尝试解压
-	contentEncoding := resp.Header.Get("Content-Encoding")
-	if contentEncoding != "" && contentEncoding != "identity" {
-		if decompressed, err := decompressResponse(bytes.NewReader(respBody), contentEncoding); err == nil {
-			respBody = decompressed
-			logger.Info("✅ 解压成功: %s, 原始大小: %d, 解压后大小: %d",
-				contentEncoding, len(respBody), len(decompressed))
-		} else {
-			logger.Error("❌ 解压失败: %v, Content-Encoding: %s", err, contentEncoding)
-		}
-	}
-
-	// 打印响应体前200字节用于调试
-	respPreview := respBody
-	if len(respPreview) > 200 {
-		respPreview = respPreview[:200]
-	}
-	logger.Info("📄 响应体预览: %s", string(respPreview))
-
-	model := requestedModel
-	var inputTokens, outputTokens int
-	var cost float64
-
-	// 解析响应以获取 token 使用情况和模型信息
-	var responseBodyForHistory string
-	if resp.StatusCode == 200 && len(respBody) > 0 {
-		// 尝试解析响应以获取 token 使用情况和模型信息
-		var result struct {
-			Model string `json:"model"`
-			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if err := json.Unmarshal(respBody, &result); err != nil {
-			logger.Error("❌ JSON解析失败: %v, 原始响应: %s", err, string(respBody))
-		} else {
-			// 如果响应中有模型信息，使用响应中的模型
-			if result.Model != "" {
-				model = result.Model
-			}
-			// 保存 token 信息
-			inputTokens = result.Usage.InputTokens
-			outputTokens = result.Usage.OutputTokens
-			logger.Info("✅ JSON解析成功 - Model: %s, InputTokens: %d, OutputTokens: %d",
-				model, inputTokens, outputTokens)
-		}
-		responseBodyForHistory = string(respBody)
-	}
-
-	// 如果模型仍然为空，使用默认值
-	if model == "" {
-		model = "unknown"
-	}
-
-	// 记录统计信息
-	duration := time.Since(startTime).Milliseconds()
-	cost = calculateCost(model, inputTokens, outputTokens)
-	stats.RecordUsage(provider.ID, provider.Name, model, "non-stream", "claude",
-		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
-
-	// Save to history
-	history.AddRecord(history.RequestRecord{
-		ID:              requestID,
-		Timestamp:       startTime,
-		Method:          method,
-		Path:            path,
-		ClientIP:        clientIP,
-		KeyID:           keyID,
-		Provider:        provider.Name,
-		Model:           model,
-		StatusCode:      resp.StatusCode,
-		Duration:        duration,
-		RequestBody:     requestBody,
-		ResponseBody:    responseBodyForHistory,
-		RequestHeaders:  requestHeaders,
-		ResponseHeaders: resp.Header,
-		RequestSize:     int64(len(requestBody)),
-		ResponseSize:    int64(len(respBody)),
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		TotalTokens:     inputTokens + outputTokens,
-		Cost:            cost,
-	})
-
-	// 如果请求格式与提供商格式不匹配，需要转换响应格式
-	needsConversion := provider.IsOpenAIFormat != isIncomingOpenAIFormat
-	if needsConversion && resp.StatusCode == 200 && len(respBody) > 0 {
-		if !provider.IsOpenAIFormat && isIncomingOpenAIFormat {
-			// 提供商是 Anthropic 格式，请求是 OpenAI 格式，响应是 Anthropic，需要转为 OpenAI
-			var claudeResp map[string]interface{}
-			if json.Unmarshal(respBody, &claudeResp) == nil {
-				openaiResp := convertClaudeToOpenAIResponse(claudeResp)
-				if converted, err := json.Marshal(openaiResp); err == nil {
-					respBody = converted
-					logger.Info("✅ 非流式响应已从 Claude 转换为 OpenAI 格式")
-				}
-			}
-		} else if provider.IsOpenAIFormat && !isIncomingOpenAIFormat {
-			// 提供商是 OpenAI 格式，请求是 Anthropic 格式，响应是 OpenAI，需要转为 Anthropic
-			var openaiResp map[string]interface{}
-			if json.Unmarshal(respBody, &openaiResp) == nil {
-				claudeResp := convertOpenAIToClaude(openaiResp)
-				if converted, err := json.Marshal(claudeResp); err == nil {
-					respBody = converted
-					logger.Info("✅ 非流式响应已从 OpenAI 转换为 Claude 格式")
-				}
-			}
-		}
-	}
-
-	// 原封不动透传响应体，不做任何格式化处理
-	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), respBody)
-}
+// ============================================================
+// 费用计算
+// ============================================================
 
 func calculateCost(model string, inputTokens, outputTokens int) float64 {
 	var inputCost, outputCost float64
@@ -720,11 +651,12 @@ func calculateCost(model string, inputTokens, outputTokens int) float64 {
 	return float64(inputTokens)*inputCost + float64(outputTokens)*outputCost
 }
 
-// convertClaudeToOpenAI 将 Claude 格式的请求转换为 OpenAI 格式
+// ============================================================
+// 格式转换函数
+// ============================================================
+
 func convertClaudeToOpenAI(claudeReq map[string]interface{}) map[string]interface{} {
 	openaiReq := make(map[string]interface{})
-
-	// 复制基本字段
 	if model, ok := claudeReq["model"]; ok {
 		openaiReq["model"] = model
 	}
@@ -737,58 +669,41 @@ func convertClaudeToOpenAI(claudeReq map[string]interface{}) map[string]interfac
 	if topP, ok := claudeReq["top_p"]; ok {
 		openaiReq["top_p"] = topP
 	}
-
-	// 转换 max_tokens
 	if maxTokens, ok := claudeReq["max_tokens"]; ok {
 		openaiReq["max_tokens"] = maxTokens
 	}
 
-	// 处理 messages - Claude 的 system 可能是单独字段
 	messages := []interface{}{}
-
-	// 如果有 system 字段，添加为第一条消息
 	if system, ok := claudeReq["system"].(string); ok && system != "" {
 		messages = append(messages, map[string]interface{}{
 			"role":    "system",
 			"content": system,
 		})
 	}
-
-	// 添加其他消息
 	if claudeMessages, ok := claudeReq["messages"].([]interface{}); ok {
 		messages = append(messages, claudeMessages...)
 	}
-
 	openaiReq["messages"] = messages
-
 	return openaiReq
 }
 
-// convertOpenAIToClaude 将 OpenAI 格式的响应转换为 Claude 格式
 func convertOpenAIToClaude(openaiResp map[string]interface{}) map[string]interface{} {
 	claudeResp := make(map[string]interface{})
-
-	// 基本字段映射
 	if id, ok := openaiResp["id"]; ok {
 		claudeResp["id"] = id
 	}
 	if model, ok := openaiResp["model"]; ok {
 		claudeResp["model"] = model
 	}
-
 	claudeResp["type"] = "message"
 	claudeResp["role"] = "assistant"
 
-	// 转换 choices 为 content
 	if choices, ok := openaiResp["choices"].([]interface{}); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]interface{}); ok {
 			if message, ok := choice["message"].(map[string]interface{}); ok {
 				if content, ok := message["content"].(string); ok {
 					claudeResp["content"] = []map[string]interface{}{
-						{
-							"type": "text",
-							"text": content,
-						},
+						{"type": "text", "text": content},
 					}
 				}
 			}
@@ -798,7 +713,6 @@ func convertOpenAIToClaude(openaiResp map[string]interface{}) map[string]interfa
 		}
 	}
 
-	// 转换 usage
 	if usage, ok := openaiResp["usage"].(map[string]interface{}); ok {
 		claudeUsage := make(map[string]interface{})
 		if promptTokens, ok := usage["prompt_tokens"]; ok {
@@ -809,15 +723,11 @@ func convertOpenAIToClaude(openaiResp map[string]interface{}) map[string]interfa
 		}
 		claudeResp["usage"] = claudeUsage
 	}
-
 	return claudeResp
 }
 
-// convertClaudeToOpenAIResponse 将 Claude 格式的非流式响应转换为 OpenAI 格式
 func convertClaudeToOpenAIResponse(claudeResp map[string]interface{}) map[string]interface{} {
 	openaiResp := make(map[string]interface{})
-
-	// 基本字段映射
 	if id, ok := claudeResp["id"]; ok {
 		openaiResp["id"] = id
 	}
@@ -827,7 +737,6 @@ func convertClaudeToOpenAIResponse(claudeResp map[string]interface{}) map[string
 	openaiResp["object"] = "chat.completion"
 	openaiResp["created"] = time.Now().Unix()
 
-	// 转换 content 为 choices
 	var content string
 	if contentArr, ok := claudeResp["content"].([]interface{}); ok && len(contentArr) > 0 {
 		if firstContent, ok := contentArr[0].(map[string]interface{}); ok {
@@ -853,7 +762,6 @@ func convertClaudeToOpenAIResponse(claudeResp map[string]interface{}) map[string
 		},
 	}
 
-	// 转换 usage
 	if usage, ok := claudeResp["usage"].(map[string]interface{}); ok {
 		openaiUsage := make(map[string]interface{})
 		if inputTokens, ok := usage["input_tokens"]; ok {
@@ -869,15 +777,11 @@ func convertClaudeToOpenAIResponse(claudeResp map[string]interface{}) map[string
 		}
 		openaiResp["usage"] = openaiUsage
 	}
-
 	return openaiResp
 }
 
-// convertOpenAIStreamToClaude 将 OpenAI 格式的流式响应块转换为 Claude 格式
 func convertOpenAIStreamToClaude(openaiChunk map[string]interface{}) map[string]interface{} {
 	claudeChunk := make(map[string]interface{})
-
-	// 基本字段
 	if id, ok := openaiChunk["id"]; ok {
 		claudeChunk["id"] = id
 	}
@@ -885,31 +789,23 @@ func convertOpenAIStreamToClaude(openaiChunk map[string]interface{}) map[string]
 		claudeChunk["model"] = model
 	}
 
-	// 处理 choices
 	if choices, ok := openaiChunk["choices"].([]interface{}); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]interface{}); ok {
-			// 检查是否有 delta
 			if delta, ok := choice["delta"].(map[string]interface{}); ok {
 				if content, ok := delta["content"].(string); ok && content != "" {
-					// 内容块
 					claudeChunk["type"] = "content_block_delta"
 					claudeChunk["delta"] = map[string]interface{}{
 						"type": "text_delta",
 						"text": content,
 					}
 				} else if role, ok := delta["role"].(string); ok {
-					// 开始块
 					claudeChunk["type"] = "message_start"
 					claudeChunk["message"] = map[string]interface{}{
-						"id":    claudeChunk["id"],
-						"type":  "message",
-						"role":  role,
-						"model": claudeChunk["model"],
+						"id": claudeChunk["id"], "type": "message",
+						"role": role, "model": claudeChunk["model"],
 					}
 				}
 			}
-
-			// 检查 finish_reason
 			if finishReason, ok := choice["finish_reason"]; ok && finishReason != nil {
 				claudeChunk["type"] = "message_delta"
 				claudeChunk["delta"] = map[string]interface{}{
@@ -919,7 +815,6 @@ func convertOpenAIStreamToClaude(openaiChunk map[string]interface{}) map[string]
 		}
 	}
 
-	// 转换 usage（如果有）
 	if usage, ok := openaiChunk["usage"].(map[string]interface{}); ok {
 		claudeUsage := make(map[string]interface{})
 		if promptTokens, ok := usage["prompt_tokens"].(float64); ok {
@@ -930,15 +825,11 @@ func convertOpenAIStreamToClaude(openaiChunk map[string]interface{}) map[string]
 		}
 		claudeChunk["usage"] = claudeUsage
 	}
-
 	return claudeChunk
 }
 
-// convertOpenAIToClaudeRequest 将 OpenAI 格式的请求转换为 Claude 格式
 func convertOpenAIToClaudeRequest(openaiReq map[string]interface{}) map[string]interface{} {
 	claudeReq := make(map[string]interface{})
-
-	// 复制基本字段
 	if model, ok := openaiReq["model"]; ok {
 		claudeReq["model"] = model
 	}
@@ -955,10 +846,8 @@ func convertOpenAIToClaudeRequest(openaiReq map[string]interface{}) map[string]i
 		claudeReq["max_tokens"] = maxTokens
 	}
 
-	// 转换 messages - OpenAI 的 role:system 可能内嵌在 messages 里
 	var systemMsg string
 	var claudeMessages []interface{}
-
 	if messages, ok := openaiReq["messages"].([]interface{}); ok {
 		for _, msg := range messages {
 			if msgMap, ok := msg.(map[string]interface{}); ok {
@@ -972,20 +861,15 @@ func convertOpenAIToClaudeRequest(openaiReq map[string]interface{}) map[string]i
 			}
 		}
 	}
-
 	if systemMsg != "" {
 		claudeReq["system"] = systemMsg
 	}
 	claudeReq["messages"] = claudeMessages
-
 	return claudeReq
 }
 
-// convertClaudeStreamToOpenAI 将 Claude 流式响应转换为 OpenAI 格式
 func convertClaudeStreamToOpenAI(claudeChunk map[string]interface{}) map[string]interface{} {
 	openaiChunk := make(map[string]interface{})
-
-	// 基本字段
 	if id, ok := claudeChunk["id"]; ok {
 		openaiChunk["id"] = id
 	}
@@ -994,36 +878,29 @@ func convertClaudeStreamToOpenAI(claudeChunk map[string]interface{}) map[string]
 	}
 	openaiChunk["object"] = "chat.completion.chunk"
 
-	// 处理类型
 	chunkType, _ := claudeChunk["type"].(string)
-
 	var choices []interface{}
+
 	switch chunkType {
 	case "message_start":
-		// 开始消息
 		if msg, ok := claudeChunk["message"].(map[string]interface{}); ok {
 			choices = []interface{}{
 				map[string]interface{}{
-					"index": 0,
-					"delta": map[string]interface{}{
-						"role": msg["role"],
-					},
+					"index":         0,
+					"delta":         map[string]interface{}{"role": msg["role"]},
 					"finish_reason": nil,
 				},
 			}
 		}
 	case "content_block_delta":
-		// 内容块增量
 		if delta, ok := claudeChunk["delta"].(map[string]interface{}); ok {
 			deltaType, _ := delta["type"].(string)
 			if deltaType == "text_delta" {
 				if text, ok := delta["text"].(string); ok {
 					choices = []interface{}{
 						map[string]interface{}{
-							"index": 0,
-							"delta": map[string]interface{}{
-								"content": text,
-							},
+							"index":         0,
+							"delta":         map[string]interface{}{"content": text},
 							"finish_reason": nil,
 						},
 					}
@@ -1031,23 +908,20 @@ func convertClaudeStreamToOpenAI(claudeChunk map[string]interface{}) map[string]
 			}
 		}
 	case "message_delta":
-		// 消息结束
 		if delta, ok := claudeChunk["delta"].(map[string]interface{}); ok {
 			if stopReason, ok := delta["stop_reason"].(string); ok {
 				choices = []interface{}{
 					map[string]interface{}{
-						"index": 0,
-						"delta": map[string]interface{}{},
+						"index":         0,
+						"delta":         map[string]interface{}{},
 						"finish_reason": stopReason,
 					},
 				}
 			}
 		}
 	}
-
 	openaiChunk["choices"] = choices
 
-	// 转换 usage
 	if usage, ok := claudeChunk["usage"].(map[string]interface{}); ok {
 		openaiUsage := make(map[string]interface{})
 		if inputTokens, ok := usage["input_tokens"].(float64); ok {
@@ -1059,6 +933,5 @@ func convertClaudeStreamToOpenAI(claudeChunk map[string]interface{}) map[string]
 		openaiUsage["total_tokens"] = 0
 		openaiChunk["usage"] = openaiUsage
 	}
-
 	return openaiChunk
 }

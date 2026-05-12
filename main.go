@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"switchai/appdata"
+	"switchai/cert"
 	"switchai/config"
 	"switchai/history"
 	"switchai/logger"
@@ -39,6 +40,7 @@ func init() {
 func main() {
 	// Parse command line flags
 	port := flag.String("p", "7777", "Port to listen on")
+	tls := flag.Bool("tls", false, "Enable TLS/HTTPS (default: plain HTTP)")
 	install := flag.Bool("install", false, "Install as system service")
 	uninstall := flag.Bool("uninstall", false, "Uninstall system service")
 	skipAuth := flag.Bool("skip", false, "Skip authentication (for internal network deployment)")
@@ -100,10 +102,10 @@ func main() {
 	}
 
 	// Normal startup
-	startServer(*port)
+	startServer(*port, *tls)
 }
 
-func startServer(port string) {
+func startServer(port string, tls bool) {
 	// 初始化统计
 	stats.Init()
 
@@ -140,29 +142,43 @@ func startServer(port string) {
 	// 启动自动更新器（服务模式下）
 	isService := update.IsRunningAsService()
 	if isService {
-		updater := update.NewAutoUpdater()
-		updater.SetUpdateCallback(func(result *update.CheckResult) {
-			logger.Info("自动下载并安装新版本: %s", result.Latest.String())
-			if err := update.DownloadAndInstall(result.DownloadURL); err != nil {
-				logger.Error("自动更新失败: %v", err)
-				return
-			}
-			// 更新完成后重启服务
-			if err := update.RestartService(); err != nil {
-				logger.Error("重启服务失败: %v", err)
-			}
-		})
-		go updater.Start()
-		logger.Info("自动更新服务已启动 (服务模式)")
+		// updater := update.NewAutoUpdater()
+		// updater.SetUpdateCallback(func(result *update.CheckResult) {
+		// 	logger.Info("自动下载并安装新版本: %s", result.Latest.String())
+		// 	if err := update.DownloadAndInstall(result.DownloadURL); err != nil {
+		// 		logger.Error("自动更新失败: %v", err)
+		// 		return
+		// 	}
+		// 	// 更新完成后重启服务
+		// 	if err := update.RestartService(); err != nil {
+		// 		logger.Error("重启服务失败: %v", err)
+		// 	}
+		// })
+		// go updater.Start()
+		// logger.Info("自动更新服务已启动 (服务模式)")
 	}
 
 	// 启动服务器
 	go func() {
-		logger.Info("Starting SwitchAI service on %s", addr)
-		fmt.Printf("\n🚀 SwitchAI is running on http://localhost:%s\n\n", port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("Failed to start server: %v", err)
-			log.Fatalf("Failed to start server: %v", err)
+		if tls {
+			certPath, keyPath, err := cert.EnsureCertificates(appdata.GetDataDir())
+			if err != nil {
+				logger.Error("Failed to prepare TLS certificates: %v", err)
+				log.Fatalf("Failed to prepare TLS certificates: %v", err)
+			}
+			logger.Info("Starting SwitchAI HTTPS service on %s", addr)
+			fmt.Printf("\n🚀 SwitchAI is running on https://localhost:%s\n\n", port)
+			if err := srv.ListenAndServeTLS(certPath, keyPath); err != nil && err != http.ErrServerClosed {
+				logger.Error("Failed to start server: %v", err)
+				log.Fatalf("Failed to start server: %v", err)
+			}
+		} else {
+			logger.Info("Starting SwitchAI HTTP service on %s", addr)
+			fmt.Printf("\n🚀 SwitchAI is running on http://localhost:%s\n\n", port)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("Failed to start server: %v", err)
+				log.Fatalf("Failed to start server: %v", err)
+			}
 		}
 	}()
 

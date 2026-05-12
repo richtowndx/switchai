@@ -251,8 +251,24 @@
                     <input type="text" name="api_key" required placeholder="sk-ant-...">
                 </div>
                 <div class="form-group">
-                    <label>模型名称</label>
-                    <input type="text" name="model" required placeholder="step-3.5-flash">
+                    <label>默认模型</label>
+                    <input type="text" name="default_model" required placeholder="e.g. claude-sonnet-4-6">
+                </div>
+                <div class="form-group">
+                    <label>Haiku 模型</label>
+                    <input type="text" name="haiku_model" placeholder="e.g. claude-haiku-4-5 (可选)">
+                </div>
+                <div class="form-group">
+                    <label>Sonnet 模型</label>
+                    <input type="text" name="sonnet_model" placeholder="e.g. claude-sonnet-4-6 (可选)">
+                </div>
+                <div class="form-group">
+                    <label>Opus 模型</label>
+                    <input type="text" name="opus_model" placeholder="e.g. claude-opus-4-7 (可选)">
+                </div>
+                <div class="form-group">
+                    <label>Fast 模型</label>
+                    <input type="text" name="fast_model" placeholder="e.g. claude-haiku-4-5 (可选)">
                 </div>
                 <div class="form-group">
                     <label>API 格式</label>
@@ -289,8 +305,24 @@
                     <input type="text" name="api_key" id="editApiKey" placeholder="留空则保持不变，输入新值则覆盖">
                 </div>
                 <div class="form-group">
-                    <label>模型名称</label>
-                    <input type="text" name="model" id="editModel" required placeholder="step-3.5-flash">
+                    <label>默认模型</label>
+                    <input type="text" name="default_model" id="editDefaultModel" required placeholder="e.g. claude-sonnet-4-6">
+                </div>
+                <div class="form-group">
+                    <label>Haiku 模型</label>
+                    <input type="text" name="haiku_model" id="editHaikuModel" placeholder="e.g. claude-haiku-4-5 (可选)">
+                </div>
+                <div class="form-group">
+                    <label>Sonnet 模型</label>
+                    <input type="text" name="sonnet_model" id="editSonnetModel" placeholder="e.g. claude-sonnet-4-6 (可选)">
+                </div>
+                <div class="form-group">
+                    <label>Opus 模型</label>
+                    <input type="text" name="opus_model" id="editOpusModel" placeholder="e.g. claude-opus-4-7 (可选)">
+                </div>
+                <div class="form-group">
+                    <label>Fast 模型</label>
+                    <input type="text" name="fast_model" id="editFastModel" placeholder="e.g. claude-haiku-4-5 (可选)">
                 </div>
                 <div class="form-group">
                     <label>API 格式</label>
@@ -992,8 +1024,8 @@
                     </div>
                     <div class="provider-item-stats">
                         <div class="provider-stat">
-                            <div class="provider-stat-value">${p.model}</div>
-                            <div class="provider-stat-label">模型</div>
+                            <div class="provider-stat-value">${p.default_model || p.model || '-'}</div>
+                            <div class="provider-stat-label">默认模型</div>
                         </div>
                         <div class="provider-stat">
                             <div class="provider-stat-value">${p.is_openai_format ? 'OpenAI' : 'Anthropic'}</div>
@@ -1047,7 +1079,11 @@
             document.getElementById('editName').value = provider.name;
             document.getElementById('editBaseUrl').value = provider.base_url;
             document.getElementById('editApiKey').value = ''; // 不返回API Key，保持为空
-            document.getElementById('editModel').value = provider.model;
+            document.getElementById('editDefaultModel').value = provider.default_model || provider.model || '';
+            document.getElementById('editHaikuModel').value = provider.haiku_model || '';
+            document.getElementById('editSonnetModel').value = provider.sonnet_model || '';
+            document.getElementById('editOpusModel').value = provider.opus_model || '';
+            document.getElementById('editFastModel').value = provider.fast_model || '';
             document.getElementById('editIsOpenAIFormat').value = provider.is_openai_format ? 'true' : 'false';
 
             showEditModal();
@@ -1058,12 +1094,12 @@
             const name = document.getElementById('editName').value;
             const baseUrl = document.getElementById('editBaseUrl').value;
             const apiKey = document.getElementById('editApiKey').value;
-            const model = document.getElementById('editModel').value;
+            const model = document.getElementById('editDefaultModel').value;
             const isOpenAIFormat = document.getElementById('editIsOpenAIFormat').value === 'true';
 
             // apiKey 可以为空，此时使用提供商的已有密钥进行测试
             if (!baseUrl || !model) {
-                showTestResult('请填写完整的配置信息（Base URL 和模型名称必填）', false);
+                showTestResult('请填写完整的配置信息（Base URL 和默认模型必填）', false);
                 return;
             }
 
@@ -1084,9 +1120,16 @@
                     } else if (data.response) {
                         // 如果没有解析出 aiReply，显示原始响应
                         try {
-                            const respJson = JSON.parse(data.response);
-                            msg += `\n\n原始响应:\n${JSON.stringify(respJson, null, 2)}`;
-                        } catch {
+                            // Only try to parse as JSON if response looks like JSON
+                            const trimmedResponse = data.response ? data.response.trim() : '';
+                            if (trimmedResponse && (trimmedResponse.startsWith('{') || trimmedResponse.startsWith('['))) {
+                                const respJson = JSON.parse(data.response);
+                                msg += `\n\n原始响应:\n${JSON.stringify(respJson, null, 2)}`;
+                            } else {
+                                msg += `\n\n原始响应: ${data.response}`;
+                            }
+                        } catch (parseErr) {
+                            // If JSON parsing fails, just show the raw response
                             msg += `\n\n原始响应: ${data.response}`;
                         }
                     }
@@ -1123,9 +1166,16 @@
                         msg += `\n\nAI 回复: ${data.aiReply}`;
                     } else if (data.response) {
                         try {
-                            const respJson = JSON.parse(data.response);
-                            msg += `\n\n原始响应:\n${JSON.stringify(respJson, null, 2)}`;
-                        } catch {
+                            // Only try to parse as JSON if response looks like JSON
+                            const trimmedResponse = data.response ? data.response.trim() : '';
+                            if (trimmedResponse && (trimmedResponse.startsWith('{') || trimmedResponse.startsWith('['))) {
+                                const respJson = JSON.parse(data.response);
+                                msg += `\n\n原始响应:\n${JSON.stringify(respJson, null, 2)}`;
+                            } else {
+                                msg += `\n\n原始响应: ${data.response}`;
+                            }
+                        } catch (parseErr) {
+                            // If JSON parsing fails, just show the raw response
                             msg += `\n\n原始响应: ${data.response}`;
                         }
                     }
@@ -1169,7 +1219,11 @@
                 name: formData.get('name'),
                 base_url: formData.get('base_url'),
                 api_key: formData.get('api_key'),
-                model: formData.get('model').trim(),
+                default_model: formData.get('default_model').trim(),
+                haiku_model: (formData.get('haiku_model') || '').trim(),
+                sonnet_model: (formData.get('sonnet_model') || '').trim(),
+                opus_model: (formData.get('opus_model') || '').trim(),
+                fast_model: (formData.get('fast_model') || '').trim(),
                 is_openai_format: formData.get('is_openai_format') === 'true'
             };
 
@@ -1202,7 +1256,11 @@
                 name: formData.get('name'),
                 base_url: formData.get('base_url'),
                 api_key: formData.get('api_key'),
-                model: formData.get('model').trim(),
+                default_model: formData.get('default_model').trim(),
+                haiku_model: (formData.get('haiku_model') || '').trim(),
+                sonnet_model: (formData.get('sonnet_model') || '').trim(),
+                opus_model: (formData.get('opus_model') || '').trim(),
+                fast_model: (formData.get('fast_model') || '').trim(),
                 is_openai_format: formData.get('is_openai_format') === 'true',
                 is_active: providers.find(p => p.id === id)?.is_active || false,
                 created_at: providers.find(p => p.id === id)?.created_at || new Date().toISOString()

@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
@@ -530,7 +531,7 @@ func testProvider(c *gin.Context) {
 	if provider.IsOpenAIFormat {
 		// OpenAI 格式
 		openAIReq := map[string]interface{}{
-			"model": provider.Model,
+			"model": provider.ResolveModel("default_model"),
 			"messages": []map[string]interface{}{
 				{"role": "user", "content": "hi"},
 			},
@@ -542,7 +543,7 @@ func testProvider(c *gin.Context) {
 	} else {
 		// Claude 格式
 		claudeReq := map[string]interface{}{
-			"model": provider.Model,
+			"model": provider.ResolveModel("default_model"),
 			"messages": []map[string]interface{}{
 				{"role": "user", "content": "hi"},
 			},
@@ -665,12 +666,12 @@ func testServerKey(c *gin.Context) {
 	var targetURL string
 
 	// 获取本服务地址
-	baseURL := "http://" + c.Request.Host
+	baseURL := "https://" + c.Request.Host
 
 	// 根据要测试的格式发送请求，代理会自动进行格式转换
 	if isOpenAIFormat {
 		openAIReq := map[string]interface{}{
-			"model": provider.Model,
+			"model": provider.ResolveModel("default_model"),
 			"messages": []map[string]interface{}{
 				{"role": "user", "content": "hi"},
 			},
@@ -680,7 +681,7 @@ func testServerKey(c *gin.Context) {
 		targetURL = baseURL + "/v1/chat/completions"
 	} else {
 		claudeReq := map[string]interface{}{
-			"model": provider.Model,
+			"model": provider.ResolveModel("default_model"),
 			"messages": []map[string]interface{}{
 				{"role": "user", "content": "hi"},
 			},
@@ -713,7 +714,12 @@ func testServerKey(c *gin.Context) {
 	}
 	log.Printf("📡 Request details - BaseURL: %s, Format: %s, Key: %s", baseURL, req.ProviderType, maskedKey)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 	resp, err := client.Do(testReq)
 	if err != nil {
 		log.Printf("❌ Server-key test connection failed: %v", err)
