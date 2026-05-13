@@ -7,8 +7,11 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/json"
+	"hash/fnv"
 	"io"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"switchai/config"
 	"switchai/history"
@@ -21,10 +24,21 @@ import (
 	"github.com/google/uuid"
 )
 
-const maxProviderRetries = 3
+const maxProviderRetries = 1  // 简化：只尝试一次，不重试
 
+// RegisterRoutes 注册所有代理路由
+// 在路由注册时就区分服务类型：Anthropic/OpenAI 格式使用 /v1/ 前缀，Copilot 使用 /copilot/ 或 /chat/completions
 func RegisterRoutes(r *gin.Engine) {
-	r.Any("/v1/*path", proxyHandler)
+	// OpenAI 格式 API 路由
+	r.Any("/v1/chat/completions", openAIHandler)
+	r.POST("/v1/completions", openAIHandler)
+
+	// Anthropic 格式 API 路由
+	r.POST("/v1/messages", anthropicHandler)
+
+	// Copilot 专用路由 (不含 /v1 前缀)
+	r.POST("/chat/completions", copilotHandler)
+	r.Any("/copilot/*path", copilotHandler)
 }
 
 // ============================================================
@@ -146,22 +160,44 @@ func processRequestBody(bodyBytes []byte, provider *config.Provider, isIncomingO
 		logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, provider.Name)
 		requestBody["model"] = resolved
 		result.RequestedModel = resolved
+
+		// Copilot 模型处理：归一化 + 兼容性回退
+		if provider.IsCopilot() {
+			normalized := NormalizeCopilotModelID(resolved)
+			if normalized != resolved {
+				logger.Info("Copilot model normalization: %s → %s", resolved, normalized)
+			}
+			chatModel := ResolveCopilotModel(normalized)
+			if chatModel != normalized {
+				logger.Info("Copilot model fallback: %s → %s", normalized, chatModel)
+			}
+			requestBody["model"] = chatModel
+			result.RequestedModel = chatModel
+		}
 	}
 
-	// 格式转换
-	needsConversion := provider.IsOpenAIFormat != isIncomingOpenAIFormat
-	if needsConversion {
-		if provider.IsOpenAIFormat && !isIncomingOpenAIFormat {
-			logger.Info("Converting Anthropic request to OpenAI format")
+	// 格式转换（4 种情况）：
+	//   openai → openai : 不转换，URL = /chat/completions
+	//   openai → claude : 转换，URL = /v1/messages
+	//   claude → openai : 转换，URL = /chat/completions
+	//   claude → claude : 不转换，URL = /v1/messages
+	// 目标 URL 始终由 provider 自身格式决定；仅在格式不匹配时转换请求体。
+	result.TargetURL = buildTargetURLForConversion(provider, provider.IsOpenAIFormat)
+	if provider.IsOpenAIFormat != isIncomingOpenAIFormat {
+		if provider.IsOpenAIFormat {
+			// 传入 Claude 格式 → provider 需要 OpenAI 格式
+			logger.Info("Converting Claude request to OpenAI format")
 			requestBody = convertClaudeToOpenAI(requestBody)
-			result.TargetURL = buildTargetURLForConversion(provider, true)
-		} else if !provider.IsOpenAIFormat && isIncomingOpenAIFormat {
-			logger.Info("Converting OpenAI request to Anthropic format")
+		} else {
+			// 传入 OpenAI 格式 → provider 需要 Claude 格式
+			logger.Info("Converting OpenAI request to Claude format")
 			requestBody = convertOpenAIToClaudeRequest(requestBody)
-			result.TargetURL = buildTargetURLForConversion(provider, false)
 		}
-	} else if provider.IsOpenAIFormat && isIncomingOpenAIFormat {
-		result.TargetURL = buildTargetURLForConversion(provider, true)
+	}
+
+	// Copilot 提供商：固定目标 URL 为 Copilot Chat Completions
+	if provider.IsCopilot() {
+		result.TargetURL = CopilotTargetURL(provider)
 	}
 
 	// 重新序列化
@@ -176,27 +212,51 @@ func processRequestBody(bodyBytes []byte, provider *config.Provider, isIncomingO
 // ============================================================
 
 // sendRequest 发送单次请求到上游，返回响应（不做重试）
-func sendRequest(method, targetURL string, originalHeaders http.Header, bodyBytes []byte, provider *config.Provider) (*http.Response, error) {
+func sendRequest(method, targetURL string, originalHeaders http.Header, bodyBytes []byte, provider *config.Provider, copilotToken string) (*http.Response, error) {
 	req, err := http.NewRequest(method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
 	}
 
-	// 复制请求头（跳过原始 Authorization）
-	for key, values := range originalHeaders {
-		if key == "Authorization" {
-			continue
+	if copilotToken != "" {
+		// Copilot 提供商：注入 Copilot 专用 header
+		for k, v := range InjectCopilotHeaders(originalHeaders, copilotToken) {
+			for _, val := range v {
+				req.Header.Add(k, val)
+			}
 		}
-		for _, value := range values {
-			req.Header.Add(key, value)
+	} else {
+		// 普通提供商：复制请求头（跳过原始 Authorization / Content-Type / Content-Length）
+		// Content-Length 不转发：请求体可能经过格式转换，长度已变，由 http 客户端重新计算
+		for key, values := range originalHeaders {
+			if key == "Authorization" || key == "Content-Type" || key == "Content-Length" {
+				continue
+			}
+			for _, value := range values {
+				req.Header.Add(key, value)
+			}
+		}
+
+		// 设置供应商的 API Key
+		req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	// 创建 HTTP client（如果 provider 配置了代理则使用代理）
+	client := http.DefaultClient
+	if provider.ProxyURL != "" {
+		proxyURL, err := url.Parse(provider.ProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy URL %q: %w", provider.ProxyURL, err)
+		}
+		client = &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyURL(proxyURL),
+			},
 		}
 	}
 
-	// 设置供应商的 API Key
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -227,11 +287,63 @@ func isRetryableError(resp *http.Response) bool {
 	return false
 }
 
+// hashClientRemote 将客户端 IP:PORT 哈希为 uint64，用于 provider 选择。
+// 相同 IP:PORT 始终得到相同 hash 值，保证客户端亲和性。
+func hashClientRemote(remoteAddr string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(remoteAddr))
+	return h.Sum64()
+}
+
 // ============================================================
-// 主入口：proxyHandler
+// Handler 配置
 // ============================================================
 
-func proxyHandler(c *gin.Context) {
+// handlerConfig 封装 handler 的格式配置
+type handlerConfig struct {
+	isIncomingOpenAIFormat bool // 请求是否为 OpenAI 格式
+	isCopilot              bool // 是否为 Copilot 处理器
+	formatName             string // 格式名称（用于日志）
+}
+
+// ============================================================
+// 主入口：特定格式的 Proxy Handler
+// ============================================================
+
+// openAIHandler 处理 OpenAI 格式的请求
+func openAIHandler(c *gin.Context) {
+	baseProxyHandler(c, &handlerConfig{
+		isIncomingOpenAIFormat: true,
+		isCopilot:              false,
+		formatName:             "OpenAI",
+	})
+}
+
+// anthropicHandler 处理 Anthropic/Claude 格式的请求
+func anthropicHandler(c *gin.Context) {
+	baseProxyHandler(c, &handlerConfig{
+		isIncomingOpenAIFormat: false,
+		isCopilot:              false,
+		formatName:             "Anthropic",
+	})
+}
+
+// copilotHandler 处理 Copilot 格式的请求
+func copilotHandler(c *gin.Context) {
+	baseProxyHandler(c, &handlerConfig{
+		isIncomingOpenAIFormat: false, // Copilot 使用类 Anthropic 格式
+		isCopilot:              true,
+		formatName:             "Copilot",
+	})
+}
+
+// ============================================================
+// 公共 Proxy Handler 逻辑
+// ============================================================
+
+// baseProxyHandler 公共的代理处理逻辑
+// 所有特定格式的 handler 都调用此函数，传入各自的格式配置
+func baseProxyHandler(c *gin.Context, cfg *handlerConfig) {
 	startTime := time.Now()
 	requestID := uuid.New().String()
 
@@ -241,30 +353,32 @@ func proxyHandler(c *gin.Context) {
 		return
 	}
 
-	// 2. 检测请求格式
-	isIncomingOpenAIFormat := strings.HasPrefix(c.Request.URL.Path, "/v1/chat")
-
-	// 3. 读取请求体
+	// 2. 读取请求体
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
 		return
 	}
 
-	// 4. 轮询重试：最多尝试 maxProviderRetries 个不同 provider
+	// 3. 基于客户端 IP:PORT 计算 hash
+	clientHash := hashClientRemote(c.Request.RemoteAddr)
+	logger.Info("Incoming request: ID=%s, Method=%s, Path=%s, Format=%s, ClientHash=%d",
+		requestID, c.Request.Method, c.Request.URL.Path, cfg.formatName, clientHash)
+
+	// 5. 重试：最多尝试 maxProviderRetries 个不同 provider
 	var lastErr error
 	for attempt := 0; attempt < maxProviderRetries; attempt++ {
-		provider := config.GetConfig().GetNextProvider(isIncomingOpenAIFormat)
+		provider := config.GetConfig().GetClientHashedProvider(clientHash, attempt)
 		if provider == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No provider configured"})
 			return
 		}
 
-		logger.Info("📡 Provider attempt %d/%d: %s (format: isOpenAI=%v)",
-			attempt+1, maxProviderRetries, provider.Name, provider.IsOpenAIFormat)
+		logger.Info("📡 Provider attempt %d/%d: %s (format: isOpenAI=%v, isCopilot=%v)",
+			attempt+1, maxProviderRetries, provider.Name, provider.IsOpenAIFormat, provider.IsCopilot())
 
 		// 处理请求体（模型解析 + 格式转换）
-		processed, err := processRequestBody(bodyBytes, provider, isIncomingOpenAIFormat,
+		processed, err := processRequestBody(bodyBytes, provider, cfg.isIncomingOpenAIFormat,
 			c.Request.URL.Path, c.Request.URL.RawQuery)
 		if err != nil {
 			logger.Error("❌ Failed to process request body: %v", err)
@@ -275,9 +389,23 @@ func proxyHandler(c *gin.Context) {
 		logger.Info("📡 代理转发 - Provider: %s, BaseURL: %s → Target: %s",
 			provider.Name, provider.BaseURL, processed.TargetURL)
 
+		// 解析 Copilot token（如果是 Copilot 提供商，自动刷新过期 token）
+		copilotToken := ""
+		if provider.IsCopilot() {
+			copilotToken = RefreshCopilotToken(provider)
+			if copilotToken == "" {
+				copilotToken = ResolveCopilotToken(provider)
+			}
+			if copilotToken == "" {
+				logger.Error("❌ Copilot 提供商 %s 缺少有效的 Copilot Token", provider.Name)
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Copilot token is not available. Please authorize GitHub Copilot in the web interface first."})
+				return
+			}
+		}
+
 		// 发送请求到上游
 		resp, err := sendRequest(c.Request.Method, processed.TargetURL,
-			c.Request.Header, processed.BodyBytes, provider)
+			c.Request.Header, processed.BodyBytes, provider, copilotToken)
 		if err != nil {
 			lastErr = err
 			if _, ok := err.(*retryableError); ok {
@@ -286,22 +414,21 @@ func proxyHandler(c *gin.Context) {
 				continue
 			}
 			logger.Error("❌ Provider %s 连接失败: %v", provider.Name, err)
-			continue
+			return
 		}
 		defer resp.Body.Close()
 
-		logger.Info("📥 收到响应 - Provider: %s, Status: %d, Content-Type: %s",
-			provider.Name, resp.StatusCode, resp.Header.Get("Content-Type"))
+		logger.Info("📥 收到响应 - Provider: %s, Status: %d", provider.Name, resp.StatusCode)
 
-		// 5. 处理响应
+		// 处理响应
 		if processed.IsStream {
 			handleStreamResponse(c, resp, provider, requestID, startTime,
 				c.Request.Method, c.Request.URL.Path, processed.ModifiedRequestBody,
-				c.Request.Header, processed.RequestedModel, keyID, clientIP, isIncomingOpenAIFormat)
+				c.Request.Header, processed.RequestedModel, keyID, clientIP, cfg.isIncomingOpenAIFormat)
 		} else {
 			handleNonStreamResponse(c, resp, provider, requestID, startTime,
 				c.Request.Method, c.Request.URL.Path, processed.ModifiedRequestBody,
-				c.Request.Header, processed.RequestedModel, keyID, clientIP, isIncomingOpenAIFormat)
+				c.Request.Header, processed.RequestedModel, keyID, clientIP, cfg.isIncomingOpenAIFormat)
 		}
 		return
 	}
@@ -670,21 +797,247 @@ func convertClaudeToOpenAI(claudeReq map[string]interface{}) map[string]interfac
 		openaiReq["top_p"] = topP
 	}
 	if maxTokens, ok := claudeReq["max_tokens"]; ok {
-		openaiReq["max_tokens"] = maxTokens
+		openaiReq["max_completion_tokens"] = maxTokens
+	}
+
+	// Convert tools: Anthropic format → OpenAI function calling format
+	if tools, ok := claudeReq["tools"].([]interface{}); ok {
+		var openaiTools []interface{}
+		for _, t := range tools {
+			if tm, ok := t.(map[string]interface{}); ok {
+				oaTool := map[string]interface{}{
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":        tm["name"],
+						"description": tm["description"],
+					},
+				}
+				if schema, ok := tm["input_schema"]; ok {
+					oaTool["function"].(map[string]interface{})["parameters"] = schema
+				}
+				openaiTools = append(openaiTools, oaTool)
+			}
+		}
+		if len(openaiTools) > 0 {
+			openaiReq["tools"] = openaiTools
+		}
 	}
 
 	messages := []interface{}{}
-	if system, ok := claudeReq["system"].(string); ok && system != "" {
-		messages = append(messages, map[string]interface{}{
-			"role":    "system",
-			"content": system,
-		})
+
+	// System prompt: handle both string and array formats
+	if system, ok := claudeReq["system"]; ok {
+		var systemText string
+		switch s := system.(type) {
+		case string:
+			systemText = s
+		case []interface{}:
+			var parts []string
+			for _, block := range s {
+				if bm, ok := block.(map[string]interface{}); ok {
+					if t, ok := bm["text"].(string); ok {
+						parts = append(parts, t)
+					}
+				}
+			}
+			systemText = strings.Join(parts, "\n")
+		}
+		if systemText != "" {
+			messages = append(messages, map[string]interface{}{
+				"role":    "system",
+				"content": systemText,
+			})
+		}
 	}
+
+	// Convert messages: Anthropic content blocks → OpenAI format
 	if claudeMessages, ok := claudeReq["messages"].([]interface{}); ok {
-		messages = append(messages, claudeMessages...)
+		for _, msg := range claudeMessages {
+			msgMap, ok := msg.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			role, _ := msgMap["role"].(string)
+			content := msgMap["content"]
+
+			switch role {
+			case "user":
+				converted := convertClaudeUserMsg(content)
+				messages = append(messages, converted...)
+			case "assistant":
+				converted := convertClaudeAssistantMsg(content)
+				messages = append(messages, converted)
+			default:
+				messages = append(messages, msgMap)
+			}
+		}
 	}
 	openaiReq["messages"] = messages
 	return openaiReq
+}
+
+// convertClaudeUserMsg converts a Claude user message content to OpenAI format.
+// Handles: text blocks → string, tool_result → separate tool role messages, image → image_url.
+func convertClaudeUserMsg(content interface{}) []interface{} {
+	// Simple string content
+	if s, ok := content.(string); ok {
+		return []interface{}{map[string]interface{}{"role": "user", "content": s}}
+	}
+
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return []interface{}{map[string]interface{}{"role": "user", "content": content}}
+	}
+
+	var textParts []string
+	var toolResults []interface{}
+	var contentParts []interface{} // for multimodal
+
+	for _, block := range blocks {
+		bm, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := bm["type"].(string)
+
+		switch blockType {
+		case "text":
+			if text, ok := bm["text"].(string); ok {
+				textParts = append(textParts, text)
+			}
+		case "tool_result":
+			toolResults = append(toolResults, bm)
+		case "image":
+			if src, ok := bm["source"].(map[string]interface{}); ok {
+				url := ""
+				if t, ok := src["type"].(string); ok && t == "base64" {
+					if mt, ok := src["media_type"].(string); ok {
+						if d, ok := src["data"].(string); ok {
+							url = "data:" + mt + ";base64," + d
+						}
+					}
+				} else if t, ok := src["type"].(string); ok && t == "url" {
+					url, _ = src["url"].(string)
+				}
+				if url != "" {
+					contentParts = append(contentParts, map[string]interface{}{
+						"type": "image_url",
+						"image_url": map[string]interface{}{"url": url},
+					})
+				}
+			}
+		}
+	}
+
+	var result []interface{}
+
+	// Build the user message
+	if len(toolResults) == 0 {
+		// No tool results: simple user message
+		allText := strings.Join(textParts, "\n")
+		if len(contentParts) > 0 {
+			// Multimodal: text + images
+			var parts []interface{}
+			if allText != "" {
+				parts = append(parts, map[string]interface{}{"type": "text", "text": allText})
+			}
+			parts = append(parts, contentParts...)
+			result = append(result, map[string]interface{}{"role": "user", "content": parts})
+		} else {
+			result = append(result, map[string]interface{}{"role": "user", "content": allText})
+		}
+	} else {
+		// Has tool results: user message with text, then tool result messages
+		if len(textParts) > 0 {
+			result = append(result, map[string]interface{}{
+				"role":    "user",
+				"content": strings.Join(textParts, "\n"),
+			})
+		}
+		for _, tr := range toolResults {
+			trMap, _ := tr.(map[string]interface{})
+			toolUseID, _ := trMap["tool_use_id"].(string)
+			trContent := ""
+			if c, ok := trMap["content"].(string); ok {
+				trContent = c
+			} else if cArr, ok := trMap["content"].([]interface{}); ok {
+				var cParts []string
+				for _, cb := range cArr {
+					if cbm, ok := cb.(map[string]interface{}); ok {
+						if t, ok := cbm["text"].(string); ok {
+							cParts = append(cParts, t)
+						}
+					}
+				}
+				trContent = strings.Join(cParts, "\n")
+			}
+			result = append(result, map[string]interface{}{
+				"role":         "tool",
+				"tool_call_id": toolUseID,
+				"content":      trContent,
+			})
+		}
+	}
+
+	if len(result) == 0 {
+		return []interface{}{map[string]interface{}{"role": "user", "content": ""}}
+	}
+	return result
+}
+
+// convertClaudeAssistantMsg converts a Claude assistant message content to OpenAI format.
+// Strips thinking/redacted_thinking blocks, converts tool_use → tool_calls.
+func convertClaudeAssistantMsg(content interface{}) interface{} {
+	if s, ok := content.(string); ok {
+		return map[string]interface{}{"role": "assistant", "content": s}
+	}
+
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return map[string]interface{}{"role": "assistant", "content": content}
+	}
+
+	var textParts []string
+	var toolCalls []interface{}
+
+	for _, block := range blocks {
+		bm, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := bm["type"].(string)
+
+		switch blockType {
+		case "text":
+			if text, ok := bm["text"].(string); ok {
+				textParts = append(textParts, text)
+			}
+		case "tool_use":
+			id, _ := bm["id"].(string)
+			name, _ := bm["name"].(string)
+			input := bm["input"]
+			// OpenAI requires arguments as JSON string
+			argsJSON, _ := json.Marshal(input)
+			toolCalls = append(toolCalls, map[string]interface{}{
+				"id":   id,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": string(argsJSON),
+				},
+			})
+			// Skip thinking/redacted_thinking
+		}
+	}
+
+	msg := map[string]interface{}{
+		"role":    "assistant",
+		"content": strings.Join(textParts, "\n"),
+	}
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+	}
+	return msg
 }
 
 func convertOpenAIToClaude(openaiResp map[string]interface{}) map[string]interface{} {
@@ -701,14 +1054,51 @@ func convertOpenAIToClaude(openaiResp map[string]interface{}) map[string]interfa
 	if choices, ok := openaiResp["choices"].([]interface{}); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]interface{}); ok {
 			if message, ok := choice["message"].(map[string]interface{}); ok {
-				if content, ok := message["content"].(string); ok {
-					claudeResp["content"] = []map[string]interface{}{
-						{"type": "text", "text": content},
+				var contentBlocks []interface{}
+
+				// Text content
+				if text, ok := message["content"].(string); ok && text != "" {
+					contentBlocks = append(contentBlocks, map[string]interface{}{
+						"type": "text", "text": text,
+					})
+				}
+
+				// Tool calls → tool_use blocks
+				if toolCalls, ok := message["tool_calls"].([]interface{}); ok {
+					for _, tc := range toolCalls {
+						if tcm, ok := tc.(map[string]interface{}); ok {
+							fn, _ := tcm["function"].(map[string]interface{})
+							name, _ := fn["name"].(string)
+							args := fn["arguments"]
+							tcID, _ := tcm["id"].(string)
+							contentBlocks = append(contentBlocks, map[string]interface{}{
+								"type":  "tool_use",
+								"id":    tcID,
+								"name":  name,
+								"input": args,
+							})
+						}
 					}
 				}
-			}
-			if finishReason, ok := choice["finish_reason"]; ok {
-				claudeResp["stop_reason"] = finishReason
+
+				if len(contentBlocks) == 0 {
+					contentBlocks = append(contentBlocks, map[string]interface{}{
+						"type": "text", "text": "",
+					})
+				}
+				claudeResp["content"] = contentBlocks
+
+				// Map finish reasons
+				if fr, ok := choice["finish_reason"].(string); ok {
+					switch fr {
+					case "tool_calls":
+						claudeResp["stop_reason"] = "tool_use"
+					case "stop":
+						claudeResp["stop_reason"] = "end_turn"
+					default:
+						claudeResp["stop_reason"] = fr
+					}
+				}
 			}
 		}
 	}

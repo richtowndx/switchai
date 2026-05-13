@@ -21,20 +21,28 @@ type SessionTokenEntry struct {
 }
 
 type Provider struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	BaseURL        string `json:"base_url"`
-	APIKey         string `json:"api_key"`
-	Model          string `json:"model"`         // 兼容旧字段
-	DefaultModel   string `json:"default_model"` // 默认模型
-	HaikuModel     string `json:"haiku_model"`   // Haiku 模型
-	SonnetModel    string `json:"sonnet_model"`  // Sonnet 模型
-	OpusModel      string `json:"opus_model"`    // Opus 模型
-	FastModel      string `json:"fast_model"`    // Fast 模型
-	IsActive       bool   `json:"is_active"`
-	CreatedAt      string `json:"created_at"`
-	Order          int    `json:"order"`
-	IsOpenAIFormat bool   `json:"is_openai_format"` // 标识是否为 OpenAI 格式的 API
+	ID                   string `json:"id"`
+	Name                 string `json:"name"`
+	BaseURL              string `json:"base_url"`
+	APIKey               string `json:"api_key"`
+	Model                string `json:"model"`         // 兼容旧字段
+	DefaultModel         string `json:"default_model"` // 默认模型
+	HaikuModel           string `json:"haiku_model"`   // Haiku 模型
+	SonnetModel          string `json:"sonnet_model"`  // Sonnet 模型
+	OpusModel            string `json:"opus_model"`    // Opus 模型
+	FastModel            string `json:"fast_model"`    // Fast 模型
+	IsActive             bool   `json:"is_active"`
+	CreatedAt            string `json:"created_at"`
+	Order                int    `json:"order"`
+	IsOpenAIFormat       bool   `json:"is_openai_format"`        // 标识是否为 OpenAI 格式的 API
+	CopilotBaseURL       string `json:"copilot_base_url"`        // 非空表示 Copilot 提供商（github.com 或 GHES 域名）
+	CopilotAuthAccountID string `json:"copilot_auth_account_id"` // 关联的 GitHub 账号 ID
+	ProxyURL             string `json:"proxy_url"`               // 代理地址（HTTP/SOCKS5），为空则直连
+}
+
+// IsCopilot 返回是否为 Copilot 提供商
+func (p *Provider) IsCopilot() bool {
+	return p.CopilotBaseURL != ""
 }
 
 // ResolveModel 根据传入的模型键名查找供应商对应的实际模型名
@@ -176,6 +184,35 @@ func initDB() error {
 	db.Exec("ALTER TABLE providers ADD COLUMN sonnet_model TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE providers ADD COLUMN opus_model TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE providers ADD COLUMN fast_model TEXT DEFAULT ''")
+	// Copilot 支持
+	db.Exec("ALTER TABLE providers ADD COLUMN copilot_base_url TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE providers ADD COLUMN copilot_auth_account_id TEXT DEFAULT ''")
+	db.Exec("ALTER TABLE providers ADD COLUMN proxy_url TEXT DEFAULT ''")
+
+	// Copilot token 存储表
+	copilotTokenSchema := `
+	CREATE TABLE IF NOT EXISTS copilot_tokens (
+		id TEXT PRIMARY KEY,
+		github_domain TEXT NOT NULL DEFAULT 'github.com',
+		user_id INTEGER NOT NULL DEFAULT 0,
+		account_id TEXT UNIQUE NOT NULL,
+		github_token TEXT DEFAULT '',
+		copilot_token TEXT DEFAULT '',
+		token_type TEXT DEFAULT 'Bearer',
+		expires_at INTEGER DEFAULT 0,
+		login TEXT DEFAULT '',
+		avatar_url TEXT DEFAULT '',
+		created_at TEXT DEFAULT '',
+		updated_at TEXT DEFAULT ''
+	);
+	CREATE TABLE IF NOT EXISTS copilot_default_account (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		account_id TEXT DEFAULT ''
+	);`
+	_, err = db.Exec(copilotTokenSchema)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -226,7 +263,7 @@ func (c *Config) Load() error {
 	}
 
 	// 加载 providers
-	rows, err := db.Query("SELECT id, name, base_url, api_key, model, is_active, created_at, order_num, COALESCE(is_openai_format, 0), COALESCE(default_model, ''), COALESCE(haiku_model, ''), COALESCE(sonnet_model, ''), COALESCE(opus_model, ''), COALESCE(fast_model, '') FROM providers ORDER BY order_num")
+	rows, err := db.Query("SELECT id, name, base_url, api_key, model, is_active, created_at, order_num, COALESCE(is_openai_format, 0), COALESCE(default_model, ''), COALESCE(haiku_model, ''), COALESCE(sonnet_model, ''), COALESCE(opus_model, ''), COALESCE(fast_model, ''), COALESCE(copilot_base_url, ''), COALESCE(copilot_auth_account_id, ''), COALESCE(proxy_url, '') FROM providers ORDER BY order_num")
 	if err != nil {
 		return err
 	}
@@ -237,7 +274,7 @@ func (c *Config) Load() error {
 		var p Provider
 		var isActive int
 		var isOpenAIFormat int
-		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &p.APIKey, &p.Model, &isActive, &p.CreatedAt, &p.Order, &isOpenAIFormat, &p.DefaultModel, &p.HaikuModel, &p.SonnetModel, &p.OpusModel, &p.FastModel); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.BaseURL, &p.APIKey, &p.Model, &isActive, &p.CreatedAt, &p.Order, &isOpenAIFormat, &p.DefaultModel, &p.HaikuModel, &p.SonnetModel, &p.OpusModel, &p.FastModel, &p.CopilotBaseURL, &p.CopilotAuthAccountID, &p.ProxyURL); err != nil {
 			return err
 		}
 		p.IsActive = isActive == 1
@@ -317,8 +354,8 @@ func (c *Config) save() error {
 		if p.IsOpenAIFormat {
 			isOpenAIFormat = 1
 		}
-		_, err = db.Exec("INSERT INTO providers (id, name, base_url, api_key, model, is_active, created_at, order_num, is_openai_format, default_model, haiku_model, sonnet_model, opus_model, fast_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			p.ID, p.Name, p.BaseURL, p.APIKey, p.Model, isActive, p.CreatedAt, p.Order, isOpenAIFormat, p.DefaultModel, p.HaikuModel, p.SonnetModel, p.OpusModel, p.FastModel)
+		_, err = db.Exec("INSERT INTO providers (id, name, base_url, api_key, model, is_active, created_at, order_num, is_openai_format, default_model, haiku_model, sonnet_model, opus_model, fast_model, copilot_base_url, copilot_auth_account_id, proxy_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			p.ID, p.Name, p.BaseURL, p.APIKey, p.Model, isActive, p.CreatedAt, p.Order, isOpenAIFormat, p.DefaultModel, p.HaikuModel, p.SonnetModel, p.OpusModel, p.FastModel, p.CopilotBaseURL, p.CopilotAuthAccountID, p.ProxyURL)
 		if err != nil {
 			return err
 		}
@@ -379,10 +416,26 @@ func (c *Config) GetProviderByID(id string) *Provider {
 	return nil
 }
 
+// GetClientHashedProvider 根据客户端 hash 值从所有活跃 provider 中选取 provider。
+// attempt 为重试偏移量，相同 hash 不同 attempt 可命中不同 provider，避免重试始终打到同一个。
+// 格式转换由调用方（processRequestBody）负责，此处不做格式过滤。
+func (c *Config) GetClientHashedProvider(hash uint64, attempt int) *Provider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(c.Providers) == 0 {
+		return nil
+	}
+
+	idx := hash % uint64(len(c.Providers))
+	return &c.Providers[idx]
+}
+
 // round-robin 轮询计数器
 var roundRobinCounter uint64
 
 // GetNextProvider 轮询方式获取下一个匹配格式的提供商
+// 当没有匹配格式的 provider 时，降级到所有 provider（格式转换兜底）
 func (c *Config) GetNextProvider(isOpenAIFormat bool) *Provider {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -394,15 +447,21 @@ func (c *Config) GetNextProvider(isOpenAIFormat bool) *Provider {
 		}
 	}
 
-	if len(matching) == 0 && isOpenAIFormat {
+	// 没有匹配格式的 provider → 降级到全部 provider（格式转换兜底）
+	if len(matching) == 0 {
 		for i := range c.Providers {
-			if c.Providers[i].ID == c.ActiveProvider {
-				return &c.Providers[i]
+			if c.Providers[i].IsActive {
+				matching = append(matching, i)
 			}
 		}
-		if len(c.Providers) > 0 {
-			return &c.Providers[0]
+		if len(matching) == 0 {
+			for i := range c.Providers {
+				matching = append(matching, i)
+			}
 		}
+	}
+
+	if len(matching) == 0 {
 		return nil
 	}
 
@@ -748,6 +807,155 @@ func (c *Config) ResetTOTP() error {
 	c.TOTPSecret = ""
 	c.TOTPEnabled = false
 	return c.save()
+}
+
+// CopilotToken 表示 GitHub Copilot OAuth 认证的令牌数据
+type CopilotToken struct {
+	ID           string `json:"id"`
+	GitHubDomain string `json:"github_domain"` // github.com 或 GHES 域名
+	UserID       int64  `json:"user_id"`       // GitHub 用户 ID
+	AccountID    string `json:"account_id"`    // 复合账号 ID（用于唯一定位）
+	GitHubToken  string `json:"github_token"`  // GitHub OAuth token
+	CopilotToken string `json:"copilot_token"` // Copilot API token
+	TokenType    string `json:"token_type"`    // Bearer
+	ExpiresAt    int64  `json:"expires_at"`    // Unix 时间戳
+	Login        string `json:"login"`         // GitHub 用户名
+	AvatarURL    string `json:"avatar_url"`    // GitHub 头像 URL
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+}
+
+// CopilotTokenStore 提供 Copilot OAuth token 的存储和访问
+type CopilotTokenStore struct{}
+
+// GetCopilotTokenStore 返回全局 CopilotTokenStore 实例
+func GetCopilotTokenStore() *CopilotTokenStore {
+	return &CopilotTokenStore{}
+}
+
+// SaveCopilotToken 保存或更新 Copilot token
+func (s *CopilotTokenStore) SaveCopilotToken(t *CopilotToken) error {
+	_, err := db.Exec(`INSERT OR REPLACE INTO copilot_tokens
+		(id, github_domain, user_id, account_id, github_token, copilot_token, token_type, expires_at, login, avatar_url, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.GitHubDomain, t.UserID, t.AccountID, t.GitHubToken, t.CopilotToken,
+		t.TokenType, t.ExpiresAt, t.Login, t.AvatarURL, t.CreatedAt, t.UpdatedAt)
+	return err
+}
+
+// GetCopilotTokenByAccountID 根据账号 ID 获取 token
+func (s *CopilotTokenStore) GetCopilotTokenByAccountID(accountID string) (*CopilotToken, error) {
+	var t CopilotToken
+	var githubToken, copilotToken, tokenType string
+	var expiresAt int64
+	err := db.QueryRow(`SELECT id, github_domain, user_id, account_id, github_token, copilot_token, token_type, expires_at, login, avatar_url, created_at, updated_at
+		FROM copilot_tokens WHERE account_id = ?`, accountID).Scan(
+		&t.ID, &t.GitHubDomain, &t.UserID, &t.AccountID, &githubToken, &copilotToken,
+		&tokenType, &expiresAt, &t.Login, &t.AvatarURL, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	t.GitHubToken = githubToken
+	t.CopilotToken = copilotToken
+	t.TokenType = tokenType
+	t.ExpiresAt = expiresAt
+	return &t, nil
+}
+
+// DeleteCopilotTokenByAccountID 删除指定账号的 token
+func (s *CopilotTokenStore) DeleteCopilotTokenByAccountID(accountID string) error {
+	_, err := db.Exec("DELETE FROM copilot_tokens WHERE account_id = ?", accountID)
+	return err
+}
+
+// ListCopilotTokens 列出所有账号的 token（不含敏感字段）
+func (s *CopilotTokenStore) ListCopilotTokens() ([]CopilotToken, error) {
+	rows, err := db.Query("SELECT id, github_domain, user_id, account_id, github_token, copilot_token, token_type, expires_at, login, avatar_url, created_at, updated_at FROM copilot_tokens ORDER BY created_at")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tokens []CopilotToken
+	for rows.Next() {
+		var t CopilotToken
+		var githubToken, copilotToken, tokenType string
+		var expiresAt int64
+		if err := rows.Scan(&t.ID, &t.GitHubDomain, &t.UserID, &t.AccountID, &githubToken, &copilotToken,
+			&tokenType, &expiresAt, &t.Login, &t.AvatarURL, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		t.GitHubToken = githubToken
+		t.CopilotToken = copilotToken
+		t.TokenType = tokenType
+		t.ExpiresAt = expiresAt
+		tokens = append(tokens, t)
+	}
+	return tokens, nil
+}
+
+// DeleteAllCopilotTokens 删除所有 token（logout all）
+func (s *CopilotTokenStore) DeleteAllCopilotTokens() error {
+	_, err := db.Exec("DELETE FROM copilot_tokens")
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("DELETE FROM copilot_default_account")
+	return err
+}
+
+// GetDefaultAccountID 获取默认账号 ID
+func (s *CopilotTokenStore) GetDefaultAccountID() (string, error) {
+	var accountID string
+	err := db.QueryRow("SELECT account_id FROM copilot_default_account WHERE id = 1").Scan(&accountID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return accountID, err
+}
+
+// SetDefaultAccountID 设置默认账号 ID
+func (s *CopilotTokenStore) SetDefaultAccountID(accountID string) error {
+	_, err := db.Exec("INSERT OR REPLACE INTO copilot_default_account (id, account_id) VALUES (1, ?)", accountID)
+	return err
+}
+
+// AccountInfo 表示账号基本信息（不含 token）
+type AccountInfo struct {
+	ID           string `json:"id"`
+	GitHubDomain string `json:"github_domain"`
+	UserID       int64  `json:"user_id"`
+	AccountID    string `json:"account_id"`
+	Login        string `json:"login"`
+	AvatarURL    string `json:"avatar_url"`
+	IsDefault    bool   `json:"is_default"`
+	CreatedAt    string `json:"created_at"`
+}
+
+// ListCopilotAccounts 列出所有账号信息
+func (s *CopilotTokenStore) ListCopilotAccounts() ([]AccountInfo, error) {
+	defaultID, err := s.GetDefaultAccountID()
+	if err != nil {
+		return nil, err
+	}
+	tokens, err := s.ListCopilotTokens()
+	if err != nil {
+		return nil, err
+	}
+	accounts := make([]AccountInfo, 0, len(tokens))
+	for _, t := range tokens {
+		accounts = append(accounts, AccountInfo{
+			ID:           t.ID,
+			GitHubDomain: t.GitHubDomain,
+			UserID:       t.UserID,
+			AccountID:    t.AccountID,
+			Login:        t.Login,
+			AvatarURL:    t.AvatarURL,
+			IsDefault:    t.AccountID == defaultID,
+			CreatedAt:    t.CreatedAt,
+		})
+	}
+	return accounts, nil
 }
 
 // Shutdown 关闭数据库连接

@@ -51,6 +51,10 @@
         .btn-success:hover { background: #38a169; }
         .btn-warning { background: #ed8936; color: white; }
         .btn-warning:hover { background: #dd6b20; }
+        .btn-copilot { background: linear-gradient(135deg, #8B5CF6, #6366F1); color: white; }
+        .btn-copilot:hover { background: linear-gradient(135deg, #7C3AED, #5558E6); }
+        .btn-secondary { background: #e2e8f0; color: #4a5568; }
+        .btn-secondary:hover { background: #cbd5e0; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; }
         .modal.show { display: flex; align-items: center; justify-content: center; }
         .modal-content { background: white; border-radius: 8px; padding: 30px; max-width: 500px; width: 90%; }
@@ -61,6 +65,7 @@
         .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
         .badge-active { background: #48bb78; color: white; }
         .badge-inactive { background: #cbd5e0; color: #4a5568; }
+        .badge-copilot { background: linear-gradient(135deg, #8B5CF6, #6366F1); color: white; }
 
         /* Login styles */
         .login-container { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
@@ -228,6 +233,7 @@
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                 <h2>API 提供商</h2>
                 <button class="btn-primary" onclick="showAddModal()">添加提供商</button>
+                <button class="btn-copilot" onclick="showCopilotAuthModal()">Copilot认证</button>
             </div>
             <div class="provider-list" id="providerList"></div>
         </div>
@@ -243,40 +249,69 @@
                     <input type="text" name="name" required placeholder="例如: Anthropic Official">
                 </div>
                 <div class="form-group">
-                    <label>Base URL</label>
-                    <input type="url" name="base_url" required placeholder="https://api.anthropic.com">
+                    <label>提供商类型</label>
+                    <select id="addProviderType" onchange="onAddProviderTypeChange()" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
+                        <option value="anthropic">Anthropic 格式</option>
+                        <option value="openai">OpenAI 格式</option>
+                        <option value="copilot">Copilot 提供商</option>
+                    </select>
                 </div>
-                <div class="form-group">
-                    <label>API Key</label>
-                    <input type="text" name="api_key" required placeholder="sk-ant-...">
+                <!-- Copilot 专属字段 -->
+                <div id="addCopilotFields" class="hidden">
+                    <div class="form-group">
+                        <label>Copilot 账号</label>
+                        <select id="addCopilotAccount" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;" onchange="onAddCopilotAccountChange()">
+                            <option value="">-- 请先在" Copilot认证"中添加账号 --</option>
+                        </select>
+                        <p style="font-size: 12px; color: #666; margin-top: 5px;">使用已认证的 Copilot 账号发送请求</p>
+                    </div>
+                </div>
+                <!-- 普通提供商字段 -->
+                <div id="addStandardFields">
+                    <div class="form-group">
+                        <label>Base URL</label>
+                        <input type="url" name="base_url" id="addBaseUrl" required placeholder="https://api.anthropic.com">
+                    </div>
+                    <div class="form-group">
+                        <label>API Key</label>
+                        <input type="text" name="api_key" id="addApiKey" required placeholder="sk-ant-...">
+                    </div>
                 </div>
                 <div class="form-group">
                     <label>默认模型</label>
-                    <input type="text" name="default_model" required placeholder="e.g. claude-sonnet-4-6">
+                    <input type="text" name="default_model" required id="addDefaultModel" placeholder="e.g. claude-sonnet-4-6">
                 </div>
                 <div class="form-group">
                     <label>Haiku 模型</label>
-                    <input type="text" name="haiku_model" placeholder="e.g. claude-haiku-4-5 (可选)">
+                    <input type="text" name="haiku_model" id="addHaikuModel" placeholder="e.g. claude-haiku-4-5 (可选)">
                 </div>
                 <div class="form-group">
                     <label>Sonnet 模型</label>
-                    <input type="text" name="sonnet_model" placeholder="e.g. claude-sonnet-4-6 (可选)">
+                    <input type="text" name="sonnet_model" id="addSonnetModel" placeholder="e.g. claude-sonnet-4-6 (可选)">
                 </div>
                 <div class="form-group">
                     <label>Opus 模型</label>
-                    <input type="text" name="opus_model" placeholder="e.g. claude-opus-4-7 (可选)">
+                    <input type="text" name="opus_model" id="addOpusModel" placeholder="e.g. claude-opus-4-7 (可选)">
                 </div>
                 <div class="form-group">
                     <label>Fast 模型</label>
-                    <input type="text" name="fast_model" placeholder="e.g. claude-haiku-4-5 (可选)">
+                    <input type="text" name="fast_model" id="addFastModel" placeholder="e.g. claude-haiku-4-5 (可选)">
                 </div>
                 <div class="form-group">
-                    <label>API 格式</label>
-                    <select name="is_openai_format" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
-                        <option value="false">Anthropic 格式</option>
-                        <option value="true">OpenAI 格式</option>
-                    </select>
-                    <p style="font-size: 12px; color: #666; margin-top: 5px;">选择该厂商使用的 API 格式</p>
+                    <label>代理地址</label>
+                    <input type="text" name="proxy_url" id="addProxyUrl" placeholder="e.g. http://127.0.0.1:7890 或 socks5://... (可选)">
+                    <p style="font-size: 12px; color: #666; margin-top: 5px;">设置后，该提供商的请求将通过此代理转发</p>
+                </div>
+                <!-- API 格式选择 (非 Copilot 提供商) -->
+                <div id="addApiFormatSection">
+                    <div class="form-group">
+                        <label>API 格式</label>
+                        <select name="is_openai_format" id="addIsOpenAIFormat" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
+                            <option value="false">Anthropic 格式</option>
+                            <option value="true">OpenAI 格式</option>
+                        </select>
+                        <p style="font-size: 12px; color: #666; margin-top: 5px;">选择该厂商使用的 API 格式</p>
+                    </div>
                 </div>
                 <div style="display: flex; gap: 10px; justify-content: flex-end;">
                     <button type="button" class="btn-danger" onclick="hideAddModal()">取消</button>
@@ -297,12 +332,41 @@
                     <input type="text" name="name" id="editName" required placeholder="例如: Anthropic Official">
                 </div>
                 <div class="form-group">
-                    <label>Base URL</label>
-                    <input type="url" name="base_url" id="editBaseUrl" required placeholder="https://api.anthropic.com">
+                    <label>提供商类型</label>
+                    <select id="editProviderType" onchange="onEditProviderTypeChange()" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
+                        <option value="anthropic">Anthropic 格式</option>
+                        <option value="openai">OpenAI 格式</option>
+                        <option value="copilot">Copilot 提供商</option>
+                    </select>
                 </div>
-                <div class="form-group">
-                    <label>API Key</label>
-                    <input type="text" name="api_key" id="editApiKey" placeholder="留空则保持不变，输入新值则覆盖">
+                <!-- Copilot 专属字段 -->
+                <div id="editCopilotFields" class="hidden">
+                    <div class="form-group">
+                        <label>Copilot 账号</label>
+                        <select id="editCopilotAccount" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
+                            <option value="">-- 请先在" Copilot认证"中添加账号 --</option>
+                        </select>
+                        <p style="font-size: 12px; color: #666; margin-top: 5px;">使用已认证的 Copilot 账号发送请求</p>
+                    </div>
+                </div>
+                <!-- 普通提供商字段 -->
+                <div id="editStandardFields">
+                    <div class="form-group">
+                        <label>Base URL</label>
+                        <input type="url" name="base_url" id="editBaseUrl" placeholder="https://api.anthropic.com">
+                    </div>
+                    <div class="form-group">
+                        <label>API Key</label>
+                        <input type="text" name="api_key" id="editApiKey" placeholder="留空则保持不变，输入新值则覆盖">
+                    </div>
+                    <div class="form-group">
+                        <label>API 格式</label>
+                        <select name="is_openai_format" id="editIsOpenAIFormat" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
+                            <option value="false">Anthropic 格式</option>
+                            <option value="true">OpenAI 格式</option>
+                        </select>
+                        <p style="font-size: 12px; color: #666; margin-top: 5px;">选择该厂商使用的 API 格式</p>
+                    </div>
                 </div>
                 <div class="form-group">
                     <label>默认模型</label>
@@ -325,12 +389,9 @@
                     <input type="text" name="fast_model" id="editFastModel" placeholder="e.g. claude-haiku-4-5 (可选)">
                 </div>
                 <div class="form-group">
-                    <label>API 格式</label>
-                    <select name="is_openai_format" id="editIsOpenAIFormat" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
-                        <option value="false">Anthropic 格式</option>
-                        <option value="true">OpenAI 格式</option>
-                    </select>
-                    <p style="font-size: 12px; color: #666; margin-top: 5px;">选择该厂商使用的 API 格式</p>
+                    <label>代理地址</label>
+                    <input type="text" name="proxy_url" id="editProxyUrl" placeholder="e.g. http://127.0.0.1:7890 或 socks5://... (可选)">
+                    <p style="font-size: 12px; color: #666; margin-top: 5px;">设置后，该提供商的请求将通过此代理转发</p>
                 </div>
                 <div id="testResult" class="hidden" style="margin-bottom: 15px; padding: 10px; border-radius: 4px; font-size: 14px; white-space: pre-wrap; max-height: 300px; overflow-y: auto;"></div>
                 <div style="display: flex; gap: 10px; justify-content: flex-end;">
@@ -419,6 +480,62 @@
                     <button type="submit" class="btn-success">保存</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Copilot Auth Modal -->
+    <div class="modal" id="copilotAuthModal">
+        <div class="modal-content" style="max-width: 550px;">
+            <h2 style="margin-bottom: 20px;">GitHub Copilot 认证</h2>
+
+            <!-- GitHub Domain Selector -->
+            <div class="form-group">
+                <label>GitHub 部署类型</label>
+                <div style="display: flex; gap: 10px;">
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-weight: normal;">
+                        <input type="radio" name="copilotGithubType" value="github.com" checked onchange="toggleCopilotEnterprise()"> GitHub.com
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-weight: normal;">
+                        <input type="radio" name="copilotGithubType" value="enterprise" onchange="toggleCopilotEnterprise()"> GitHub Enterprise
+                    </label>
+                </div>
+            </div>
+
+            <!-- Enterprise Domain Input (hidden by default) -->
+            <div class="form-group hidden" id="copilotEnterpriseDomainGroup">
+                <label>Enterprise 域名</label>
+                <input type="text" id="copilotEnterpriseDomain" placeholder="例如: github.mycompany.com">
+            </div>
+
+            <!-- Account List -->
+            <div id="copilotAccountsSection" class="hidden">
+                <h4 style="margin-bottom: 10px; color: #4a5568;">已认证账号</h4>
+                <div id="copilotAccountList" style="display: grid; gap: 8px; margin-bottom: 15px;"></div>
+                <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                    <button class="btn-danger" onclick="copilotLogout()" style="font-size: 12px; padding: 5px 10px;">清除所有账号</button>
+                </div>
+            </div>
+
+            <!-- Device Code Section (shown during auth) -->
+            <div id="copilotDeviceCodeSection" class="hidden" style="text-align: center; padding: 20px 0;">
+                <p style="color: #4a5568; margin-bottom: 10px;">请在浏览器中打开以下链接并输入验证码：</p>
+                <a id="copilotVerificationUrl" href="#" target="_blank" style="color: #667eea; font-size: 16px; word-break: break-all;"></a>
+                <div style="margin-top: 20px; background: #f7fafc; border: 2px dashed #667eea; border-radius: 8px; padding: 20px; display: inline-block;">
+                    <p style="color: #999; font-size: 12px; margin-bottom: 5px;">验证码</p>
+                    <p id="copilotUserCode" style="font-size: 32px; font-weight: bold; letter-spacing: 4px; color: #333; font-family: monospace;"></p>
+                    <button class="btn-secondary" onclick="copyCopilotCode()" style="margin-top: 8px; font-size: 12px; padding: 4px 12px;">复制</button>
+                </div>
+                <p id="copilotPollingStatus" style="color: #999; font-size: 13px; margin-top: 15px;">等待授权中...</p>
+            </div>
+
+            <!-- Error Display -->
+            <div id="copilotError" class="hidden" style="color: #f56565; background: #fff5f5; padding: 10px; border-radius: 4px; margin-bottom: 15px; font-size: 14px;"></div>
+
+            <!-- Action Buttons -->
+            <div style="display: flex; gap: 10px; justify-content: flex-end;">
+                <button type="button" id="copilotCancelBtn" class="btn-danger" onclick="hideCopilotAuthModal()">关闭</button>
+                <button type="button" id="copilotAddAccountBtn" class="btn-copilot" onclick="startCopilotAuth()">添加账号</button>
+            </div>
         </div>
     </div>
 
@@ -1018,6 +1135,7 @@
                             <h4>
                                 ${p.name}
                                 ${p.id === activeProvider ? '<span class="badge badge-active">当前使用</span>' : '<span class="badge badge-inactive">未激活</span>'}
+                                ${p.copilot_base_url ? '<span class="badge badge-copilot">Copilot</span>' : ''}
                             </h4>
                             <p><span class="provider-url">${p.base_url}</span></p>
                         </div>
@@ -1028,7 +1146,7 @@
                             <div class="provider-stat-label">默认模型</div>
                         </div>
                         <div class="provider-stat">
-                            <div class="provider-stat-value">${p.is_openai_format ? 'OpenAI' : 'Anthropic'}</div>
+                            <div class="provider-stat-value">${p.copilot_base_url ? 'Copilot' : (p.is_openai_format ? 'OpenAI' : 'Anthropic')}</div>
                             <div class="provider-stat-label">格式</div>
                         </div>
                     </div>
@@ -1054,11 +1172,14 @@
 
         function showAddModal() {
             document.getElementById('addModal').classList.add('show');
+            onAddProviderTypeChange();
         }
 
         function hideAddModal() {
             document.getElementById('addModal').classList.remove('show');
             document.getElementById('addForm').reset();
+            document.getElementById('addProviderType').value = 'anthropic';
+            onAddProviderTypeChange();
         }
 
         function showEditModal() {
@@ -1071,20 +1192,131 @@
             document.getElementById('testResult').classList.add('hidden');
         }
 
+        // ============================================================
+        // Copilot 提供商类型切换逻辑
+        // ============================================================
+        const COPILOT_DEFAULT_MODELS = {
+            default_model: 'gpt-5.3-codex',
+            haiku_model: 'gpt-5.3-codex',
+            sonnet_model: 'gpt-5.3-codex',
+            opus_model: 'gpt-5.3-codex',
+            fast_model: 'gpt-5.3-codex'
+        };
+
+        async function loadCopilotAccountsIntoSelect(selectId) {
+            const select = document.getElementById(selectId);
+            if (!select) return;
+            try {
+                const res = await fetch('/api/copilot/status');
+                const data = await res.json();
+                const accounts = data.accounts || [];
+                select.innerHTML = '';
+                if (accounts.length === 0) {
+                    select.innerHTML = '<option value="">-- 请先在 "Copilot认证" 中添加账号 --</option>';
+                    return;
+                }
+                select.innerHTML = accounts.map(a =>
+                    `<option value="${a.account_id}" data-domain="${a.github_domain}">${a.login}${a.is_default ? ' (默认)' : ''}${a.github_domain !== 'github.com' ? ' (' + a.github_domain + ')' : ''}</option>`
+                ).join('');
+                // 默认选中 is_default 的账号
+                const defaultAcc = accounts.find(a => a.is_default);
+                if (defaultAcc) select.value = defaultAcc.account_id;
+            } catch (err) {
+                select.innerHTML = '<option value="">-- 加载失败 --</option>';
+            }
+        }
+
+        function onAddProviderTypeChange() {
+            const type = document.getElementById('addProviderType').value;
+            const isCopilot = type === 'copilot';
+            document.getElementById('addCopilotFields').classList.toggle('hidden', !isCopilot);
+            document.getElementById('addStandardFields').classList.toggle('hidden', isCopilot);
+            document.getElementById('addApiFormatSection').classList.toggle('hidden', isCopilot);
+
+            if (isCopilot) {
+                loadCopilotAccountsIntoSelect('addCopilotAccount');
+                document.getElementById('addBaseUrl').removeAttribute('required');
+                document.getElementById('addApiKey').removeAttribute('required');
+                // 自动填充 Copilot 默认模型
+                ['default_model', 'haiku_model', 'sonnet_model', 'opus_model', 'fast_model'].forEach(m => {
+                    const input = document.getElementById('add' + m.charAt(0).toUpperCase() + m.slice(1).replace(/_([a-z])/g, (_, c) => c.toUpperCase()));
+                    if (input && !input.value) input.value = COPILOT_DEFAULT_MODELS[m];
+                });
+                // 直接用 ID 设置值
+                document.getElementById('addDefaultModel').value = COPILOT_DEFAULT_MODELS.default_model;
+                document.getElementById('addHaikuModel').value = COPILOT_DEFAULT_MODELS.haiku_model;
+                document.getElementById('addSonnetModel').value = COPILOT_DEFAULT_MODELS.sonnet_model;
+                document.getElementById('addOpusModel').value = COPILOT_DEFAULT_MODELS.opus_model;
+                document.getElementById('addFastModel').value = COPILOT_DEFAULT_MODELS.fast_model;
+            } else {
+                document.getElementById('addBaseUrl').setAttribute('required', '');
+                document.getElementById('addApiKey').setAttribute('required', '');
+            }
+        }
+
+        function onAddCopilotAccountChange() {
+            // account 选择变化时不需要额外操作
+        }
+
+        function onEditProviderTypeChange() {
+            const type = document.getElementById('editProviderType').value;
+            const isCopilot = type === 'copilot';
+            document.getElementById('editCopilotFields').classList.toggle('hidden', !isCopilot);
+            document.getElementById('editStandardFields').classList.toggle('hidden', isCopilot);
+
+            if (isCopilot) {
+                loadCopilotAccountsIntoSelect('editCopilotAccount');
+                document.getElementById('editBaseUrl').removeAttribute('required');
+                if (!document.getElementById('editDefaultModel').value) {
+                    document.getElementById('editDefaultModel').value = COPILOT_DEFAULT_MODELS.default_model;
+                }
+                if (!document.getElementById('editHaikuModel').value) {
+                    document.getElementById('editHaikuModel').value = COPILOT_DEFAULT_MODELS.haiku_model;
+                }
+                if (!document.getElementById('editSonnetModel').value) {
+                    document.getElementById('editSonnetModel').value = COPILOT_DEFAULT_MODELS.sonnet_model;
+                }
+                if (!document.getElementById('editOpusModel').value) {
+                    document.getElementById('editOpusModel').value = COPILOT_DEFAULT_MODELS.opus_model;
+                }
+                if (!document.getElementById('editFastModel').value) {
+                    document.getElementById('editFastModel').value = COPILOT_DEFAULT_MODELS.fast_model;
+                }
+            } else {
+                document.getElementById('editBaseUrl').setAttribute('required', '');
+            }
+        }
+
         function editProvider(id) {
             const provider = providers.find(p => p.id === id);
             if (!provider) return;
 
             document.getElementById('editId').value = provider.id;
             document.getElementById('editName').value = provider.name;
-            document.getElementById('editBaseUrl').value = provider.base_url;
-            document.getElementById('editApiKey').value = ''; // 不返回API Key，保持为空
+
+            const isCopilot = !!provider.copilot_base_url;
+            if (isCopilot) {
+                document.getElementById('editProviderType').value = 'copilot';
+                onEditProviderTypeChange();
+                // 设置 Copilot 账号选中
+                setTimeout(() => {
+                    const sel = document.getElementById('editCopilotAccount');
+                    if (provider.copilot_auth_account_id) sel.value = provider.copilot_auth_account_id;
+                }, 300);
+            } else {
+                document.getElementById('editProviderType').value = provider.is_openai_format ? 'openai' : 'anthropic';
+                onEditProviderTypeChange();
+                document.getElementById('editBaseUrl').value = provider.base_url;
+                document.getElementById('editApiKey').value = '';
+                document.getElementById('editIsOpenAIFormat').value = provider.is_openai_format ? 'true' : 'false';
+            }
+
             document.getElementById('editDefaultModel').value = provider.default_model || provider.model || '';
             document.getElementById('editHaikuModel').value = provider.haiku_model || '';
             document.getElementById('editSonnetModel').value = provider.sonnet_model || '';
             document.getElementById('editOpusModel').value = provider.opus_model || '';
             document.getElementById('editFastModel').value = provider.fast_model || '';
-            document.getElementById('editIsOpenAIFormat').value = provider.is_openai_format ? 'true' : 'false';
+            document.getElementById('editProxyUrl').value = provider.proxy_url || '';
 
             showEditModal();
         }
@@ -1096,10 +1328,16 @@
             const apiKey = document.getElementById('editApiKey').value;
             const model = document.getElementById('editDefaultModel').value;
             const isOpenAIFormat = document.getElementById('editIsOpenAIFormat').value === 'true';
+            const providerType = document.getElementById('editProviderType').value;
+            const isCopilot = providerType === 'copilot';
 
-            // apiKey 可以为空，此时使用提供商的已有密钥进行测试
-            if (!baseUrl || !model) {
+            // Copilot 提供商不需要 baseUrl 和 apiKey，使用 Copilot OAuth 认证
+            if (!isCopilot && (!baseUrl || !model)) {
                 showTestResult('请填写完整的配置信息（Base URL 和默认模型必填）', false);
+                return;
+            }
+            if (isCopilot && !model) {
+                showTestResult('请填写默认模型', false);
                 return;
             }
 
@@ -1215,17 +1453,30 @@
         document.getElementById('addForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(e.target);
+            const providerType = document.getElementById('addProviderType').value;
+            const isCopilot = providerType === 'copilot';
+
             const data = {
                 name: formData.get('name'),
-                base_url: formData.get('base_url'),
-                api_key: formData.get('api_key'),
                 default_model: formData.get('default_model').trim(),
                 haiku_model: (formData.get('haiku_model') || '').trim(),
                 sonnet_model: (formData.get('sonnet_model') || '').trim(),
                 opus_model: (formData.get('opus_model') || '').trim(),
                 fast_model: (formData.get('fast_model') || '').trim(),
-                is_openai_format: formData.get('is_openai_format') === 'true'
+                proxy_url: (formData.get('proxy_url') || '').trim(),
             };
+
+            if (isCopilot) {
+                data.base_url = 'https://api.githubcopilot.com';
+                data.api_key = 'copilot';
+                data.is_openai_format = true;
+                data.copilot_base_url = 'github.com';
+                data.copilot_auth_account_id = document.getElementById('addCopilotAccount').value;
+            } else {
+                data.base_url = formData.get('base_url');
+                data.api_key = formData.get('api_key');
+                data.is_openai_format = formData.get('is_openai_format') === 'true';
+            }
 
             try {
                 const res = await fetch('/api/providers', {
@@ -1251,20 +1502,33 @@
             e.preventDefault();
             const formData = new FormData(e.target);
             const id = formData.get('id');
+            const providerType = document.getElementById('editProviderType').value;
+            const isCopilot = providerType === 'copilot';
+
             const data = {
                 id: id,
                 name: formData.get('name'),
-                base_url: formData.get('base_url'),
-                api_key: formData.get('api_key'),
                 default_model: formData.get('default_model').trim(),
                 haiku_model: (formData.get('haiku_model') || '').trim(),
                 sonnet_model: (formData.get('sonnet_model') || '').trim(),
                 opus_model: (formData.get('opus_model') || '').trim(),
                 fast_model: (formData.get('fast_model') || '').trim(),
-                is_openai_format: formData.get('is_openai_format') === 'true',
+                proxy_url: (formData.get('proxy_url') || '').trim(),
                 is_active: providers.find(p => p.id === id)?.is_active || false,
                 created_at: providers.find(p => p.id === id)?.created_at || new Date().toISOString()
             };
+
+            if (isCopilot) {
+                data.base_url = 'https://api.githubcopilot.com';
+                data.api_key = 'copilot';
+                data.is_openai_format = true;
+                data.copilot_base_url = 'github.com';
+                data.copilot_auth_account_id = document.getElementById('editCopilotAccount').value;
+            } else {
+                data.base_url = formData.get('base_url');
+                data.api_key = formData.get('api_key');
+                data.is_openai_format = formData.get('is_openai_format') === 'true';
+            }
 
             try {
                 const res = await fetch(`/api/providers/${id}`, {
@@ -1354,6 +1618,204 @@
 
         // 初始检查
         checkAuth();
+
+        // ============================================================
+        // Copilot OAuth Device Flow
+        // ============================================================
+        let copilotPollTimer = null;
+
+        function showCopilotAuthModal() {
+            document.getElementById('copilotAuthModal').classList.add('show');
+            loadCopilotAccounts();
+        }
+
+        function hideCopilotAuthModal() {
+            cancelCopilotPoll();
+            document.getElementById('copilotAuthModal').classList.remove('show');
+            document.getElementById('copilotDeviceCodeSection').classList.add('hidden');
+            document.getElementById('copilotError').classList.add('hidden');
+        }
+
+        function toggleCopilotEnterprise() {
+            const radios = document.getElementsByName('copilotGithubType');
+            const isEnterprise = Array.from(radios).find(r => r.checked)?.value === 'enterprise';
+            document.getElementById('copilotEnterpriseDomainGroup').classList.toggle('hidden', !isEnterprise);
+        }
+
+        function getSelectedDomain() {
+            const radios = document.getElementsByName('copilotGithubType');
+            const val = Array.from(radios).find(r => r.checked)?.value;
+            if (val === 'enterprise') {
+                return document.getElementById('copilotEnterpriseDomain').value.trim();
+            }
+            return 'github.com';
+        }
+
+        async function loadCopilotAccounts() {
+            try {
+                const res = await fetch('/api/copilot/status');
+                const data = await res.json();
+                renderCopilotAccounts(data.accounts || []);
+            } catch (err) {
+                console.error('loadCopilotAccounts:', err);
+            }
+        }
+
+        function renderCopilotAccounts(accounts) {
+            const section = document.getElementById('copilotAccountsSection');
+            const list = document.getElementById('copilotAccountList');
+            if (!accounts || accounts.length === 0) {
+                section.classList.add('hidden');
+                return;
+            }
+            section.classList.remove('hidden');
+            list.innerHTML = accounts.map(a => `
+                <div style="display: flex; align-items: center; gap: 12px; padding: 10px; border: 1px solid #e2e8f0; border-radius: 6px; background: ${a.is_default ? '#f0f4ff' : '#fff'};">
+                    <img src="${a.avatar_url || ''}" style="width: 36px; height: 36px; border-radius: 50%;" onerror="this.style.display='none'">
+                    <div style="flex: 1; min-width: 0;">
+                        <div style="font-weight: 500; color: #333; display: flex; align-items: center; gap: 6px;">
+                            ${a.login || a.account_id}
+                            ${a.is_default ? '<span class="badge badge-active" style="font-size: 11px; padding: 2px 6px;">默认</span>' : ''}
+                            ${a.github_domain !== 'github.com' ? '<span style="font-size: 11px; color: #888;">(' + a.github_domain + ')</span>' : ''}
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 6px;">
+                        ${!a.is_default ? `<button class="btn-secondary" onclick="setDefaultCopilotAccount('${a.account_id}')" style="font-size: 11px; padding: 3px 8px;">设为默认</button>` : ''}
+                        <button class="btn-danger" onclick="removeCopilotAccount('${a.account_id}')" style="font-size: 11px; padding: 3px 8px;">移除</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function startCopilotAuth() {
+            const domain = getSelectedDomain();
+            if (!domain) {
+                showCopilotError('请输入 Enterprise 域名');
+                return;
+            }
+
+            document.getElementById('copilotAddAccountBtn').disabled = true;
+            document.getElementById('copilotError').classList.add('hidden');
+
+            try {
+                const res = await fetch('/api/copilot/device-flow', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ github_domain: domain })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    showCopilotError(data.error || '获取设备码失败');
+                    document.getElementById('copilotAddAccountBtn').disabled = false;
+                    return;
+                }
+
+                document.getElementById('copilotVerificationUrl').textContent = data.verification_uri;
+                document.getElementById('copilotVerificationUrl').href = data.verification_uri;
+                document.getElementById('copilotUserCode').textContent = data.user_code;
+                document.getElementById('copilotDeviceCodeSection').classList.remove('hidden');
+                document.getElementById('copilotPollingStatus').textContent = '等待授权中...';
+
+                pollCopilotAuth(data.device_code, data.github_domain, data.interval || 5);
+            } catch (err) {
+                showCopilotError('请求失败: ' + err.message);
+                document.getElementById('copilotAddAccountBtn').disabled = false;
+            }
+        }
+
+        function pollCopilotAuth(deviceCode, domain, interval) {
+            const pollInterval = Math.max(interval + 3, 8) * 1000;
+            document.getElementById('copilotPollingStatus').textContent = '等待授权中...';
+
+            copilotPollTimer = setTimeout(async () => {
+                try {
+                    const res = await fetch('/api/copilot/poll', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ device_code: deviceCode, github_domain: domain })
+                    });
+                    const data = await res.json();
+
+                    if (data.status === 'pending') {
+                        document.getElementById('copilotPollingStatus').textContent = '等待授权中...';
+                        const nextInterval = data.interval ? data.interval * 1000 : pollInterval;
+                        pollCopilotAuth(deviceCode, domain, nextInterval / 1000);
+                        return;
+                    }
+                    if (data.status === 'success') {
+                        document.getElementById('copilotPollingStatus').textContent = '授权成功!';
+                        document.getElementById('copilotPollingStatus').style.color = '#48bb78';
+                        document.getElementById('copilotDeviceCodeSection').classList.add('hidden');
+                        document.getElementById('copilotAddAccountBtn').disabled = false;
+                        document.getElementById('copilotPollingStatus').style.color = '';
+                        await loadCopilotAccounts();
+                        return;
+                    }
+                    if (data.status === 'error') {
+                        showCopilotError(data.error || '授权失败');
+                        document.getElementById('copilotDeviceCodeSection').classList.add('hidden');
+                        document.getElementById('copilotAddAccountBtn').disabled = false;
+                        return;
+                    }
+                } catch (err) {
+                    showCopilotError('轮询失败: ' + err.message);
+                    document.getElementById('copilotAddAccountBtn').disabled = false;
+                    return;
+                }
+            }, pollInterval);
+        }
+
+        function cancelCopilotPoll() {
+            if (copilotPollTimer) {
+                clearTimeout(copilotPollTimer);
+                copilotPollTimer = null;
+            }
+            document.getElementById('copilotAddAccountBtn').disabled = false;
+        }
+
+        async function removeCopilotAccount(accountId) {
+            if (!confirm('确定要移除此账号吗？')) return;
+            try {
+                await fetch('/api/copilot/accounts/' + encodeURIComponent(accountId), { method: 'DELETE' });
+                await loadCopilotAccounts();
+            } catch (err) {
+                showCopilotError('移除失败: ' + err.message);
+            }
+        }
+
+        async function setDefaultCopilotAccount(accountId) {
+            try {
+                await fetch('/api/copilot/accounts/' + encodeURIComponent(accountId) + '/default', { method: 'POST' });
+                await loadCopilotAccounts();
+            } catch (err) {
+                showCopilotError('设置默认账号失败: ' + err.message);
+            }
+        }
+
+        async function copilotLogout() {
+            if (!confirm('确定要清除所有 Copilot 账号吗？')) return;
+            try {
+                await fetch('/api/copilot/logout', { method: 'POST' });
+                await loadCopilotAccounts();
+            } catch (err) {
+                showCopilotError('清除失败: ' + err.message);
+            }
+        }
+
+        function copyCopilotCode() {
+            const code = document.getElementById('copilotUserCode').textContent;
+            if (code) navigator.clipboard.writeText(code).then(() => {
+                const btn = event.target;
+                btn.textContent = '已复制!';
+                setTimeout(() => { btn.textContent = '复制'; }, 1500);
+            });
+        }
+
+        function showCopilotError(msg) {
+            const el = document.getElementById('copilotError');
+            el.textContent = msg;
+            el.classList.remove('hidden');
+        }
     </script>
 </body>
 </html>

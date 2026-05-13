@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"switchai/config"
 	"switchai/history"
+	"switchai/proxy"
 	"switchai/stats"
 	"time"
 
@@ -87,6 +88,15 @@ func RegisterRoutes(r *gin.Engine) {
 		api.DELETE("/providers/:id", deleteProvider)
 		api.POST("/providers/:id/activate", activateProvider)
 		api.POST("/providers/:id/test", testProvider)
+
+		// Copilot OAuth 管理
+		api.POST("/copilot/device-flow", startCopilotDeviceFlow)
+		api.POST("/copilot/poll", pollCopilotToken)
+		api.GET("/copilot/accounts", getCopilotAccounts)
+		api.DELETE("/copilot/accounts/:id", removeCopilotAccount)
+		api.POST("/copilot/accounts/:id/default", setDefaultCopilotAccount)
+		api.POST("/copilot/logout", copilotLogout)
+		api.GET("/copilot/status", getCopilotAuthStatus)
 
 		// 统计信息
 		api.GET("/stats", getStats)
@@ -520,13 +530,93 @@ func testProvider(c *gin.Context) {
 		return
 	}
 
-	log.Printf("🔍 testProvider: id=%s, name=%s, baseURL=%s, apiKey=%s, isOpenAI=%v",
-		id, provider.Name, provider.BaseURL, provider.APIKey[:10]+"...", provider.IsOpenAIFormat)
+	log.Printf("🔍 testProvider: id=%s, name=%s, baseURL=%s, isCopilot=%v, isOpenAI=%v",
+		id, provider.Name, provider.BaseURL, provider.IsCopilot(), provider.IsOpenAIFormat)
 
 	// 根据提供商格式构建测试请求
 	var reqBody []byte
 	var targetURL string
 	var err error
+
+	if provider.IsCopilot() {
+		// Copilot 提供商
+		model := provider.ResolveModel("default_model")
+		model = proxy.NormalizeCopilotModelID(model)
+		model = proxy.ResolveCopilotModel(model)
+		openAIReq := map[string]interface{}{
+			"model": model,
+			"messages": []map[string]interface{}{
+				{"role": "user", "content": "hi"},
+			},
+			"max_completion_tokens": 10,
+		}
+		reqBody, _ = json.Marshal(openAIReq)
+		targetURL = proxy.CopilotTargetURL(provider)
+		log.Printf("🔗 Copilot format, targetURL: %s", targetURL)
+
+		// 注入 Copilot headers
+		req, err := http.NewRequest("POST", targetURL, bytes.NewReader(reqBody))
+		if err != nil {
+			log.Printf("❌ testProvider: failed to create request: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
+			return
+		}
+
+		// 尝试获取 Copilot token（自动刷新过期 token）
+		copilotToken := proxy.RefreshCopilotToken(provider)
+		if copilotToken == "" {
+			log.Printf("⚠️ testProvider: Copilot token is empty, accountID=%s", provider.CopilotAuthAccountID)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Copilot 未认证或 token 已过期，请在'Copilot认证'中重新授权"})
+			return
+		}
+		log.Printf("🔑 testProvider: got Copilot token (length=%d)", len(copilotToken))
+		for k, v := range proxy.InjectCopilotHeaders(req.Header, copilotToken) {
+			for _, val := range v {
+				req.Header.Add(k, val)
+			}
+		}
+
+		client := &http.Client{Timeout: 30 * time.Second}
+		log.Printf("📤 testProvider: sending request to %s", targetURL)
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("❌ testProvider: request failed: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Connection failed: " + err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+
+		respBody, _ := io.ReadAll(resp.Body)
+		maxLen := 200
+		if len(respBody) < maxLen {
+			maxLen = len(respBody)
+		}
+		log.Printf("📥 testProvider: response status=%d, body_len=%d, body=%s", resp.StatusCode, len(respBody), string(respBody[:maxLen]))
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			var openaiResp struct {
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+			}
+			if json.Unmarshal(respBody, &openaiResp) == nil && len(openaiResp.Choices) > 0 {
+				c.JSON(http.StatusOK, gin.H{"success": true, "status": resp.StatusCode, "response": string(respBody), "aiReply": openaiResp.Choices[0].Message.Content})
+			} else {
+				c.JSON(http.StatusOK, gin.H{"success": true, "status": resp.StatusCode, "response": string(respBody)})
+			}
+		} else {
+			// Copilot 返回错误状态码，确保返回有效的 JSON
+			errMsg := string(respBody)
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			}
+			log.Printf("❌ testProvider: Copilot error status=%d, msg=%s", resp.StatusCode, errMsg)
+			c.JSON(http.StatusBadGateway, gin.H{"success": false, "status": resp.StatusCode, "error": fmt.Sprintf("HTTP %d: %s", resp.StatusCode, errMsg)})
+		}
+		return
+	}
 
 	if provider.IsOpenAIFormat {
 		// OpenAI 格式
@@ -619,11 +709,15 @@ func testProvider(c *gin.Context) {
 			"aiReply":  aiReply,
 		})
 	} else {
+		// 非 2xx 响应，确保返回有效的 JSON
+		errMsg := string(respBody)
+		if errMsg == "" {
+			errMsg = "Unknown error"
+		}
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"status":  resp.StatusCode,
-			"message": "Connection failed",
-			"response": string(respBody),
+			"error":   errMsg,
 		})
 	}
 }
