@@ -73,7 +73,7 @@ func (e *ConnProxyEntry) handleOpenAIRequest(ctx context.Context, c *gin.Context
 
 	// 根据响应类型处理（使用 resp.ModelName）
 	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP)
+		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, "")
 	} else {
 		e.handleNonStreamResponse(c, resp.Body, resp.ModelName, requestID, startTime, keyID, clientIP)
 	}
@@ -90,11 +90,25 @@ func (e *ConnProxyEntry) handleAnthropicRequest(ctx context.Context, c *gin.Cont
 		return
 	}
 
+	// 处理响应格式转换（OpenAI -> Anthropic）
+	// 注意：流式响应的 resp.Body 是空的，转换在 handleStreamResponse 中逐块处理
+	responseBody := resp.Body
+	if resp.ConvertResponseFormat == "anthropic" && !resp.IsStream {
+		converted, err := convertOpenAIResponseToAnthropic(resp.Body)
+		if err != nil {
+			logger.Error("❌ Response format conversion failed: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Response conversion failed"})
+			return
+		}
+		responseBody = converted
+		logger.Info("✅ Response converted: OpenAI -> Anthropic (non-stream)")
+	}
+
 	// 根据响应类型处理（使用 resp.ModelName）
 	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP)
+		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, resp.ConvertResponseFormat)
 	} else {
-		e.handleNonStreamResponse(c, resp.Body, resp.ModelName, requestID, startTime, keyID, clientIP)
+		e.handleNonStreamResponse(c, responseBody, resp.ModelName, requestID, startTime, keyID, clientIP)
 	}
 }
 
@@ -144,7 +158,7 @@ func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte
 }
 
 // handleStreamResponse 处理流式响应
-func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, errCh <-chan error, modelName string, requestID string, startTime time.Time, keyID, clientIP string) {
+func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, errCh <-chan error, modelName string, requestID string, startTime time.Time, keyID, clientIP string, convertResponseFormat string) {
 	// 设置流式响应头
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -174,11 +188,19 @@ func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, 
 				firstToken = false
 			}
 
-			// 直接转发 SSE 行
-			c.Writer.WriteString(line)
+			// 处理 SSE 行：如果需要转换则转换，否则直接转发
+			outputLine := line
+			if convertResponseFormat == "anthropic" {
+				converted := convertOpenAIStreamLineToAnthropic(line)
+				if converted != "" {
+					outputLine = converted
+				}
+			}
+
+			c.Writer.WriteString(outputLine)
 			flusher.Flush()
 
-			// 提取 token 统计
+			// 提取 token 统计（使用原始行）
 			inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
 
 		case err := <-errCh:

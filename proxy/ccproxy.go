@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"sync"
@@ -31,6 +32,11 @@ type ProxyResponse struct {
 	IsStream bool
 
 	ModelName string // 可选：模型名称（用于日志记录）
+
+	// ConvertResponseFormat 响应格式转换标记
+	// "anthropic" 表示需要将 OpenAI 格式响应转换为 Anthropic 格式
+	// "" 或 "openai" 表示不转换
+	ConvertResponseFormat string
 }
 
 // CcProxy 定义统一的代理接口
@@ -184,6 +190,47 @@ func (p *ConnPool) CleanupIdle(maxIdle time.Duration) int {
 // ============================================================
 // 工具函数
 // ============================================================
+
+// 不被支持的参数列表（按提供商类型分类）
+// 这些参数在转换时需要被移除，因为上游 API 不支持
+var unsupportedParams = map[string][]string{
+	"anthropic": {
+		"structured_outputs",  // OpenAI 结构化输出，Anthropic 不支持
+		"parallel_tool_calls", // OpenAI 特定参数
+	},
+	"copilot": {
+		"structured_outputs",  // Copilot 不支持结构化输出
+		"parallel_tool_calls", // Copilot 不支持并行工具调用
+	},
+	"openai": {
+		// OpenAI 通常支持所有参数，留空
+	},
+}
+
+// FilterUnsupportedParams 过滤掉请求中不被上游支持的参数
+// 返回过滤后的请求体
+func FilterUnsupportedParams(reqBody []byte, providerType string) []byte {
+	toRemove, exists := unsupportedParams[providerType]
+	if !exists || len(toRemove) == 0 {
+		return reqBody
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(reqBody, &req); err != nil {
+		return reqBody
+	}
+
+	// 移除不支持的参数
+	for _, key := range toRemove {
+		delete(req, key)
+	}
+
+	result, err := json.Marshal(req)
+	if err != nil {
+		return reqBody
+	}
+	return result
+}
 
 // DrainReader 读取并丢弃 reader 中的所有数据
 func DrainReader(r io.Reader) {

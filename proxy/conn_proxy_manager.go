@@ -21,6 +21,8 @@ type ConnProxyManager struct {
 
 	// connTimeout 连接超时时间（超过此时间未活动的连接将被清理）
 	connTimeout time.Duration
+
+	seqid uint64
 }
 
 // ConnProxyEntry 连接代理条目（简化版，移除 tool_use_id 跟踪）
@@ -89,8 +91,9 @@ func (m *ConnProxyManager) GetOrCreate(remoteAddr string, preferredProvider *con
 	} else {
 		// 基于 hash 选择 provider
 		clientHash = hashClientRemote(remoteAddr)
-		provider = config.GetConfig().GetClientHashedProvider(clientHash, 0)
+		provider = config.GetConfig().GetClientHashedProvider(m.seqid, 0)
 		providerIdx = 0
+		m.seqid++
 	}
 
 	if provider == nil {

@@ -46,7 +46,10 @@ func NewCopilotProxy(provider *config.Provider) (CcProxy, error) {
 // SendOpenAIFormat 发送 OpenAI 格式请求
 // 内部处理：模型映射 -> 格式判断 -> 发送请求
 func (p *CopilotProxy) SendOpenAIFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
-	// 1. 处理模型映射并获取映射后的模型名
+	// 1. 过滤不支持的参数
+	reqBody = FilterUnsupportedParams(reqBody, "copilot")
+
+	// 2. 处理模型映射并获取映射后的模型名
 	modifiedBody, modelName := p.applyModelMapping(reqBody)
 
 	// 2. 解析请求检查是否为流式
@@ -72,13 +75,18 @@ func (p *CopilotProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Head
 		return &ProxyResponse{Error: err}
 	}
 
-	// 2. 处理模型映射并获取映射后的模型名
+	logger.Info("Converted Anthropic->OpenAI body: %s", string(openaiBody))
+
+	// 2. 过滤不支持的参数
+	openaiBody = FilterUnsupportedParams(openaiBody, "copilot")
+
+	// 3. 处理模型映射并获取映射后的模型名
 	modifiedBody, mappedName := p.applyModelMapping(openaiBody)
 	if mappedName != "" {
 		modelName = mappedName
 	}
 
-	// 3. 解析请求检查是否为流式
+	// 4. 解析请求检查是否为流式
 	var req map[string]interface{}
 	_ = json.Unmarshal(modifiedBody, &req)
 	isStream, _ := req["stream"].(bool)
@@ -86,10 +94,12 @@ func (p *CopilotProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Head
 	if isStream {
 		resp := p.sendCopilotStream(ctx, modifiedBody)
 		resp.ModelName = modelName
+		resp.ConvertResponseFormat = "anthropic"
 		return resp
 	}
 	resp := p.sendCopilotNonStream(ctx, modifiedBody)
 	resp.ModelName = modelName
+		resp.ConvertResponseFormat = "anthropic"
 	return resp
 }
 
@@ -125,6 +135,14 @@ func (p *CopilotProxy) applyModelMapping(reqBody []byte) ([]byte, string) {
 			req["model"] = resolved
 			modelName = resolved
 		}
+
+		// 处理 Copilot codex 模型回退（codex 模型不支持 /chat/completions）
+		resolved = ResolveCopilotModel(modelName)
+		if resolved != modelName {
+			logger.Info("Copilot codex model fallback: %s → %s", modelName, resolved)
+			req["model"] = resolved
+			modelName = resolved
+		}
 	}
 
 	result, _ := json.Marshal(req)
@@ -135,8 +153,10 @@ func (p *CopilotProxy) sendCopilotNonStream(ctx context.Context, reqBody []byte)
 	// 获取 Copilot token
 	copilotToken := RefreshCopilotToken(p.provider)
 	if copilotToken == "" {
+		logger.Error("Failed to get Copilot token for provider %s", p.provider.Name)
 		return &ProxyResponse{Error: fmt.Errorf("failed to get Copilot token")}
 	}
+	logger.Info("Using Copilot token (length: %d, prefix: %s)", len(copilotToken), copilotToken[:10])
 
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))

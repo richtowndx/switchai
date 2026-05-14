@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"switchai/config"
+	"switchai/logger"
 
 	"github.com/google/uuid"
 )
@@ -275,6 +276,7 @@ const tokenRefreshBufferSeconds int64 = 60
 // resolveCopilotToken 为 Copilot 提供商解析有效的 Copilot token
 func ResolveCopilotToken(provider *config.Provider) string {
 	if !provider.IsCopilot() {
+		logger.Error("ResolveCopilotToken: provider is not Copilot format")
 		return ""
 	}
 
@@ -287,17 +289,20 @@ func ResolveCopilotToken(provider *config.Provider) string {
 		var err error
 		accountID, err = store.GetDefaultAccountID()
 		if err != nil || accountID == "" {
+			logger.Error("ResolveCopilotToken: no default account ID (err: %v)", err)
 			return ""
 		}
 	}
 
 	token, err := store.GetCopilotTokenByAccountID(accountID)
 	if err != nil || token == nil {
+		logger.Error("ResolveCopilotToken: failed to get token for account %s (err: %v)", accountID, err)
 		return ""
 	}
 
 	// 如果 token 不需要刷新，直接返回
 	// 注意：实际刷新由 OAuth API endpoints 处理
+	logger.Info("ResolveCopilotToken: got token (len: %d, expiresAt: %d, account: %s)", len(token.CopilotToken), token.ExpiresAt, accountID)
 	return token.CopilotToken
 }
 
@@ -380,6 +385,7 @@ func RefreshCopilotToken(provider *config.Provider) string {
 
 	// 未过期（含 60 秒缓冲），直接返回
 	if !isTokenExpiringSoon(token.ExpiresAt) {
+		logger.Info("[Copilot] Token 有效，无需刷新 (expiresAt: %d, now: %d)", token.ExpiresAt, time.Now().Unix())
 		return token.CopilotToken
 	}
 
@@ -397,22 +403,24 @@ func RefreshCopilotToken(provider *config.Provider) string {
 	}
 
 	// 执行刷新
-	log.Printf("[Copilot] Token 即将过期/已过期，自动刷新 (account: %s)", accountID)
+	logger.Info("[Copilot] Token 即将过期/已过期，自动刷新 (account: %s, oldTokenLen: %d)", accountID, len(token.CopilotToken))
 	newToken, err := fetchNewCopilotToken(token.GitHubDomain, token.GitHubToken)
 	if err != nil {
-		log.Printf("[Copilot] Token 刷新失败: %v", err)
+		logger.Error("[Copilot] Token 刷新失败: %v，返回旧 token", err)
 		return token.CopilotToken // 返回旧 token，可能还能用
 	}
+
+	logger.Info("[Copilot] Token 刷新成功 (newTokenLen: %d, expiresAt: %d)", len(newToken.Token), newToken.ExpiresAt)
 
 	// 更新 DB
 	token.CopilotToken = newToken.Token
 	token.ExpiresAt = newToken.ExpiresAt
 	token.UpdatedAt = time.Now().Format(time.RFC3339)
 	if err := store.SaveCopilotToken(token); err != nil {
-		log.Printf("[Copilot] Token 保存失败: %v", err)
+		logger.Error("[Copilot] Token 保存失败: %v", err)
 	}
 
-	log.Printf("[Copilot] Token 刷新成功, 新过期时间: %d", newToken.ExpiresAt)
+	logger.Info("[Copilot] Token 刷新完成, 新过期时间: %d", newToken.ExpiresAt)
 	return newToken.Token
 }
 

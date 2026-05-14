@@ -66,7 +66,10 @@ func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.He
 // SendOpenAIFormat 发送 OpenAI 格式请求
 // 优化：转换 + 模型映射 + stream 检查一次性完成
 func (p *AnthropicProxy) SendOpenAIFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
-	// 1. 转换并处理：OpenAI → Anthropic + 模型映射 + stream 检查
+	// 1. 过滤不支持的参数（OpenAI 格式可能包含 Anthropic 不支持的参数）
+	reqBody = FilterUnsupportedParams(reqBody, "anthropic")
+
+	// 2. 转换并处理：OpenAI → Anthropic + 模型映射 + stream 检查
 	modifiedBody, modelName, isStream := p.convertAndProcessOpenAIRequest(reqBody)
 
 	if isStream {
