@@ -511,6 +511,8 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 	}
 	cost := calculateCost(model, inputTokens, outputTokens)
 
+	logZeroTokenDebug(provider.Name, requestID, requestBody, responseBody.String(), inputTokens, outputTokens)
+
 	stats.RecordUsage(provider.ID, provider.Name, model, "stream", "claude", inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
 	history.AddRecord(history.RequestRecord{
 		ID: requestID, Timestamp: startTime, Method: method, Path: path,
@@ -579,6 +581,8 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *conf
 
 	duration := time.Since(startTime).Milliseconds()
 	cost := calculateCost(model, inputTokens, outputTokens)
+	logZeroTokenDebug(provider.Name, requestID, requestBody, responseBodyForHistory, inputTokens, outputTokens)
+
 	stats.RecordUsage(provider.ID, provider.Name, model, "non-stream", "claude",
 		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
 	history.AddRecord(history.RequestRecord{
@@ -655,6 +659,15 @@ func decompressResponse(body io.Reader, contentEncoding string) ([]byte, error) 
 	default:
 		return io.ReadAll(body)
 	}
+}
+
+// logZeroTokenDebug 在 input 或 output token 计数为 0 时记录请求和应答
+func logZeroTokenDebug(providerName, requestID, requestBody, responseBody string, inputTokens, outputTokens int) {
+	if inputTokens > 0 && outputTokens > 0 {
+		return
+	}
+	logger.Info("⚠️ 零Token请求 | Provider=%s | RequestID=%s | InputTokens=%d | OutputTokens=%d | Request=%s | Response=%s",
+		providerName, requestID, inputTokens, outputTokens, requestBody, responseBody)
 }
 
 // ============================================================

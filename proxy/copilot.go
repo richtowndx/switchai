@@ -273,39 +273,6 @@ func GithubClientID(domain string) string {
 // Token refresh buffer: refresh 60 seconds before expiry
 const tokenRefreshBufferSeconds int64 = 60
 
-// resolveCopilotToken 为 Copilot 提供商解析有效的 Copilot token
-func ResolveCopilotToken(provider *config.Provider) string {
-	if !provider.IsCopilot() {
-		logger.Error("ResolveCopilotToken: provider is not Copilot format")
-		return ""
-	}
-
-	store := config.GetCopilotTokenStore()
-
-	// 确定使用哪个账号
-	accountID := provider.CopilotAuthAccountID
-	if accountID == "" {
-		// 使用默认账号
-		var err error
-		accountID, err = store.GetDefaultAccountID()
-		if err != nil || accountID == "" {
-			logger.Error("ResolveCopilotToken: no default account ID (err: %v)", err)
-			return ""
-		}
-	}
-
-	token, err := store.GetCopilotTokenByAccountID(accountID)
-	if err != nil || token == nil {
-		logger.Error("ResolveCopilotToken: failed to get token for account %s (err: %v)", accountID, err)
-		return ""
-	}
-
-	// 如果 token 不需要刷新，直接返回
-	// 注意：实际刷新由 OAuth API endpoints 处理
-	logger.Info("ResolveCopilotToken: got token (len: %d, expiresAt: %d, account: %s)", len(token.CopilotToken), token.ExpiresAt, accountID)
-	return token.CopilotToken
-}
-
 // copilotTargetURL 返回 Copilot 请求的目标 URL
 // Copilot API 端点不含 /v1 前缀: https://api.githubcopilot.com/chat/completions
 // 端口自 cc-switch: forwarder.rs rewrite_claude_transform_endpoint

@@ -390,27 +390,25 @@ switchai/
 ├── logger/                 # 日志系统（日期轮转）
 ├── history/                # 请求历史追踪
 ├── proxy/                  # API 代理处理
-│   ├── proxy.go            # 主代理逻辑：格式转换、客户端亲和性
+│   ├── proxy.go            # 主代理逻辑：格式转换、客户端亲和性、路由注册
 │   ├── copilot.go          # Copilot 协议：Header 注入、Token 管理、模型归一化
 │   ├── ccproxy.go          # Claude Code Proxy 处理（SDK 类型检测、请求适配）
 │   ├── ccproxy_handler.go  # CCProxy HTTP 处理器
 │   ├── anthropic_proxy.go  # Anthropic 原生协议代理
-│   ├── openai_proxy.go    # OpenAI 协议代理
-│   ├── copilot_proxy.go    # Copilot 专用代理
+│   ├── openai_proxy.go     # OpenAI 协议代理
+│   ├── copilot_proxy.go    # Copilot 专用代理（CcProxy 接口实现）
 │   ├── conn_proxy_manager.go # 连接级代理管理（TCP 连接复用）
 │   ├── tracked_conn.go     # 连接跟踪与流量统计
-│   ├── format_converter.go # 格式转换核心（已在 proxy.go 实现）
 │   ├── format_helper.go    # 格式转换辅助函数
 │   ├── request_converter.go # 请求格式转换
-│   ├── response_converter.go # 响应格式转换
-│   └── *.go                # 其他辅助模块
+│   └── response_converter.go # 响应格式转换
 ├── stats/                  # Token 统计
 ├── service/                # 服务安装管理
 ├── update/                 # 自动更新
-└── web/                   # Web 服务和 API
-    ├── web.go             # Web API + 静态资源 embed
-    ├── copilot.go         # Copilot OAuth Device Code Flow API
-    └── static/            # HTML/CSS/JS (打包进二进制)
+└── web/                    # Web 服务和 API
+    ├── web.go              # Web API + 静态资源 embed
+    ├── copilot.go          # Copilot OAuth Device Code Flow API
+    └── static/             # HTML/CSS/JS (打包进二进制)
 ```
 
 **特性**: 使用Go embed将web静态资源打包进二进制文件，单文件部署，无需额外依赖。

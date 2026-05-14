@@ -73,9 +73,9 @@ func (e *ConnProxyEntry) handleOpenAIRequest(ctx context.Context, c *gin.Context
 
 	// 根据响应类型处理（使用 resp.ModelName）
 	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, "")
+		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, "", reqBody)
 	} else {
-		e.handleNonStreamResponse(c, resp.Body, resp.ModelName, requestID, startTime, keyID, clientIP)
+		e.handleNonStreamResponse(c, resp.Body, resp.ModelName, requestID, startTime, keyID, clientIP, reqBody)
 	}
 }
 
@@ -106,14 +106,14 @@ func (e *ConnProxyEntry) handleAnthropicRequest(ctx context.Context, c *gin.Cont
 
 	// 根据响应类型处理（使用 resp.ModelName）
 	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, resp.ConvertResponseFormat)
+		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, resp.ConvertResponseFormat, reqBody)
 	} else {
-		e.handleNonStreamResponse(c, responseBody, resp.ModelName, requestID, startTime, keyID, clientIP)
+		e.handleNonStreamResponse(c, responseBody, resp.ModelName, requestID, startTime, keyID, clientIP, reqBody)
 	}
 }
 
 // handleNonStreamResponse 处理非流式响应
-func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte, modelName string, requestID string, startTime time.Time, keyID, clientIP string) {
+func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte, modelName string, requestID string, startTime time.Time, keyID, clientIP string, reqBody []byte) {
 	// 解析响应获取 token 统计
 	_, inputTokens, outputTokens := parseTokenStats(respBody)
 
@@ -130,6 +130,8 @@ func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte
 	// 记录统计
 	duration := time.Since(startTime).Milliseconds()
 	cost := calculateCost(model, inputTokens, outputTokens)
+
+	logZeroTokenDebug(e.Provider.Name, requestID, string(reqBody), string(respBody), inputTokens, outputTokens)
 
 	stats.RecordUsage(e.Provider.ID, e.Provider.Name, model, "non-stream", "ccproxy",
 		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
@@ -158,7 +160,7 @@ func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte
 }
 
 // handleStreamResponse 处理流式响应
-func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, errCh <-chan error, modelName string, requestID string, startTime time.Time, keyID, clientIP string, convertResponseFormat string) {
+func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, errCh <-chan error, modelName string, requestID string, startTime time.Time, keyID, clientIP string, convertResponseFormat string, reqBody []byte) {
 	// 设置流式响应头
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -227,6 +229,8 @@ done:
 	}
 
 	cost := calculateCost(model, inputTokens, outputTokens)
+
+	logZeroTokenDebug(e.Provider.Name, requestID, string(reqBody), "", inputTokens, outputTokens)
 
 	stats.RecordUsage(e.Provider.ID, e.Provider.Name, model, "stream", "ccproxy",
 		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
