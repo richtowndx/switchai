@@ -71,11 +71,11 @@ func (e *ConnProxyEntry) handleOpenAIRequest(ctx context.Context, c *gin.Context
 		return
 	}
 
-	// 根据响应类型处理
+	// 根据响应类型处理（使用 resp.ModelName）
 	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, requestID, startTime, keyID, clientIP)
+		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP)
 	} else {
-		e.handleNonStreamResponse(c, resp.Body, requestID, startTime, keyID, clientIP)
+		e.handleNonStreamResponse(c, resp.Body, resp.ModelName, requestID, startTime, keyID, clientIP)
 	}
 }
 
@@ -90,22 +90,28 @@ func (e *ConnProxyEntry) handleAnthropicRequest(ctx context.Context, c *gin.Cont
 		return
 	}
 
-	// 根据响应类型处理
+	// 根据响应类型处理（使用 resp.ModelName）
 	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, requestID, startTime, keyID, clientIP)
+		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP)
 	} else {
-		e.handleNonStreamResponse(c, resp.Body, requestID, startTime, keyID, clientIP)
+		e.handleNonStreamResponse(c, resp.Body, resp.ModelName, requestID, startTime, keyID, clientIP)
 	}
 }
 
 // handleNonStreamResponse 处理非流式响应
-func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody string, requestID string, startTime time.Time, keyID, clientIP string) {
+func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte, modelName string, requestID string, startTime time.Time, keyID, clientIP string) {
 	// 解析响应获取 token 统计
-	model, inputTokens, outputTokens := parseTokenStats(respBody)
+	_, inputTokens, outputTokens := parseTokenStats(respBody)
 
-	// 设置响应头并返回
+	// 使用 Proxy 提供的模型名（如果为空则使用 "unknown"）
+	model := modelName
+	if model == "" {
+		model = "unknown"
+	}
+
+	// 设置响应头并返回（直接使用 []byte，避免额外拷贝）
 	c.Header("Content-Type", "application/json")
-	c.Data(200, "application/json", []byte(respBody))
+	c.Data(200, "application/json", respBody)
 
 	// 记录统计
 	duration := time.Since(startTime).Milliseconds()
@@ -138,7 +144,7 @@ func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody string
 }
 
 // handleStreamResponse 处理流式响应
-func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, errCh <-chan error, requestID string, startTime time.Time, keyID, clientIP string) {
+func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, errCh <-chan error, modelName string, requestID string, startTime time.Time, keyID, clientIP string) {
 	// 设置流式响应头
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -154,7 +160,6 @@ func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, 
 	var firstTokenTime time.Time
 	firstToken := true
 	var inputTokens, outputTokens int
-	var model string
 
 	// 处理流式响应
 	for {
@@ -173,10 +178,7 @@ func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, 
 			c.Writer.WriteString(line)
 			flusher.Flush()
 
-			// 提取统计信息
-			if model == "" {
-				model = extractModelFromSSE(line)
-			}
+			// 提取 token 统计
 			inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
 
 		case err := <-errCh:
@@ -189,15 +191,19 @@ func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, 
 	}
 
 done:
+	// 使用 Proxy 提供的模型名（如果为空则使用 "unknown"）
+	model := modelName
+	if model == "" {
+		model = "unknown"
+	}
+
 	// 记录统计
 	duration := time.Since(startTime).Milliseconds()
 	var timeToFirst int64
 	if !firstTokenTime.IsZero() {
 		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
 	}
-	if model == "" {
-		model = "unknown"
-	}
+
 	cost := calculateCost(model, inputTokens, outputTokens)
 
 	stats.RecordUsage(e.Provider.ID, e.Provider.Name, model, "stream", "ccproxy",
@@ -230,16 +236,11 @@ done:
 // 辅助函数
 // ============================================================
 
-// parseTokenStats 从响应体中解析 token 统计
-func parseTokenStats(respBody string) (string, int, int) {
+// parseTokenStats 从响应体中解析 token 统计（不再解析 model）
+func parseTokenStats(respBody []byte) (string, int, int) {
 	var resp map[string]interface{}
-	if err := json.Unmarshal([]byte(respBody), &resp); err != nil {
-		return "unknown", 0, 0
-	}
-
-	model := "unknown"
-	if m, ok := resp["model"].(string); ok && m != "" {
-		model = m
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return "", 0, 0
 	}
 
 	inputTokens, outputTokens := 0, 0
@@ -266,33 +267,10 @@ func parseTokenStats(respBody string) (string, int, int) {
 		}
 	}
 
-	return model, inputTokens, outputTokens
+	return "", inputTokens, outputTokens
 }
 
-// extractModelFromSSE 从 SSE 行中提取模型名
-func extractModelFromSSE(line string) string {
-	if !strings.HasPrefix(line, "data: ") {
-		return ""
-	}
-
-	data := strings.TrimPrefix(line, "data: ")
-	if data == "[DONE]" {
-		return ""
-	}
-
-	var event map[string]interface{}
-	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return ""
-	}
-
-	if model, ok := event["model"].(string); ok {
-		return model
-	}
-
-	return ""
-}
-
-// extractTokensFromSSE 从 SSE 行中提取 token 统计
+// extractTokensFromSSE 从 SSE 行中提取 token 统计（不再提取 model）
 func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int) {
 	if !strings.HasPrefix(line, "data: ") {
 		return inputTokens, outputTokens

@@ -46,33 +46,35 @@ func NewAnthropicProxy(provider *config.Provider) (CcProxy, error) {
 }
 
 // SendAnthropicFormat 发送 Anthropic 格式请求
-// 内部处理：模型映射 -> 格式判断 -> 发送请求
+// 优化：单次 JSON 解析完成模型映射 + stream 检查
 func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqBody string) *ProxyResponse {
-	// 1. 处理模型映射
-	modifiedBody := p.applyModelMapping(reqBody)
-
-	// 2. 解析请求检查是否为流式
-	var req map[string]interface{}
-	_ = json.Unmarshal([]byte(modifiedBody), &req)
-	isStream, _ := req["stream"].(bool)
+	// 1. 一次性解析并处理：模型映射 + stream 检查
+	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
 
 	if isStream {
-		return p.sendAnthropicStream(ctx, modifiedBody)
+		resp := p.sendAnthropicStream(ctx, modifiedBody)
+		resp.ModelName = modelName
+		return resp
 	}
-	return p.sendAnthropicNonStream(ctx, modifiedBody)
+	resp := p.sendAnthropicNonStream(ctx, modifiedBody)
+	resp.ModelName = modelName
+	return resp
 }
 
 // SendOpenAIFormat 发送 OpenAI 格式请求
-// 内部处理：格式转换 -> 模型映射 -> 发送请求
+// 优化：转换 + 模型映射 + stream 检查一次性完成
 func (p *AnthropicProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *ProxyResponse {
-	// 1. 转换 OpenAI -> Anthropic
-	anthropicBody, err := p.convertOpenAIToAnthropic(reqBody)
-	if err != nil {
-		return &ProxyResponse{Error: err}
-	}
+	// 1. 转换并处理：OpenAI → Anthropic + 模型映射 + stream 检查
+	modifiedBody, modelName, isStream := p.convertAndProcessOpenAIRequest(reqBody)
 
-	// 2. 调用 Anthropic 格式方法（内部会处理模型映射）
-	return p.SendAnthropicFormat(ctx, anthropicBody)
+	if isStream {
+		resp := p.sendAnthropicStream(ctx, modifiedBody)
+		resp.ModelName = modelName
+		return resp
+	}
+	resp := p.sendAnthropicNonStream(ctx, modifiedBody)
+	resp.ModelName = modelName
+	return resp
 }
 
 // Close 释放资源
@@ -87,27 +89,95 @@ func (p *AnthropicProxy) Provider() *config.Provider {
 }
 
 // ============================================================
-// 内部方法
+// 优化后的内部方法
 // ============================================================
 
-// applyModelMapping 处理模型映射
-func (p *AnthropicProxy) applyModelMapping(reqBody string) string {
+// parseAndProcessRequest 一次性解析并处理：模型映射 + stream 检查
+// 优化：从原来的 2 次 JSON 解析 + 1 次序列化 → 1 次解析 + 1 次序列化
+func (p *AnthropicProxy) parseAndProcessRequest(reqBody string) (string, string, bool) {
 	var req map[string]interface{}
 	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
-		return reqBody
+		return reqBody, "", false
 	}
+
+	modelName := ""
+	isStream := false
 
 	// 处理模型映射
 	if model, ok := req["model"].(string); ok {
+		modelName = model
 		resolved := p.provider.ResolveModel(model)
 		if resolved != model {
 			logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, p.provider.Name)
 			req["model"] = resolved
+			modelName = resolved
 		}
 	}
 
+	// 检查 stream
+	if v, ok := req["stream"].(bool); ok {
+		isStream = v
+	}
+
+	// 一次性序列化
 	result, _ := json.Marshal(req)
-	return string(result)
+	return string(result), modelName, isStream
+}
+
+// convertAndProcessOpenAIRequest 转换 OpenAI → Anthropic + 模型映射 + stream 检查
+// 优化：从原来的 4 次 JSON 处理 → 2 次
+func (p *AnthropicProxy) convertAndProcessOpenAIRequest(openaiReq string) (string, string, bool) {
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(openaiReq), &req); err != nil {
+		return "", "", false
+	}
+
+	modelName := ""
+	if model, ok := req["model"].(string); ok {
+		modelName = model
+	}
+
+	// 构建 Anthropic 格式
+	anthropicReq := map[string]interface{}{
+		"model":      req["model"],
+		"max_tokens": req["max_tokens"],
+		"messages":   convertOpenAIMessagesToAnthropic(req["messages"]),
+	}
+
+	if v, ok := req["temperature"].(float64); ok && v > 0 {
+		anthropicReq["temperature"] = v
+	}
+	if v, ok := req["top_p"].(float64); ok && v > 0 {
+		anthropicReq["top_p"] = v
+	}
+	if v, ok := req["stream"].(bool); ok {
+		anthropicReq["stream"] = v
+	}
+
+	if tools, ok := req["tools"].([]interface{}); ok {
+		anthropicReq["tools"] = convertOpenAIToolsToAnthropic(tools)
+		anthropicReq["tool_choice"] = map[string]interface{}{"type": "auto"}
+	}
+
+	// 处理模型映射
+	if model, ok := anthropicReq["model"].(string); ok {
+		resolved := p.provider.ResolveModel(model)
+		if resolved != model {
+			logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, p.provider.Name)
+			anthropicReq["model"] = resolved
+			modelName = resolved
+		}
+	}
+
+	// 检查 stream
+	isStream := false
+	if v, ok := anthropicReq["stream"].(bool); ok {
+		isStream = v
+	}
+
+	// 一次性序列化
+	result, _ := json.Marshal(anthropicReq)
+	return string(result), modelName, isStream
 }
 
 func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody string) *ProxyResponse {
@@ -136,7 +206,7 @@ func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody str
 		return &ProxyResponse{Error: fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))}
 	}
 
-	return &ProxyResponse{Body: string(respBytes), IsStream: false}
+	return &ProxyResponse{Body: respBytes, IsStream: false}
 }
 
 func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqBody string) *ProxyResponse {
@@ -173,7 +243,11 @@ func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqBody string
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		// 使用 buffer pool 减少 memory allocation
+		buf := scannerBufferPool.Get().([]byte)
+		defer func() { scannerBufferPool.Put(buf) }()
+		
+		scanner.Buffer(buf, 1024*1024)
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -204,41 +278,6 @@ func (p *AnthropicProxy) buildURL() string {
 		baseURL += "v1/messages"
 	}
 	return baseURL
-}
-
-// ============================================================
-// 格式转换
-// ============================================================
-
-func (p *AnthropicProxy) convertOpenAIToAnthropic(openaiReq string) (string, error) {
-	var req map[string]interface{}
-	if err := json.Unmarshal([]byte(openaiReq), &req); err != nil {
-		return "", err
-	}
-
-	anthropicReq := map[string]interface{}{
-		"model":      req["model"],
-		"max_tokens": req["max_tokens"],
-		"messages":   convertOpenAIMessagesToAnthropic(req["messages"]),
-	}
-
-	if v, ok := req["temperature"].(float64); ok && v > 0 {
-		anthropicReq["temperature"] = v
-	}
-	if v, ok := req["top_p"].(float64); ok && v > 0 {
-		anthropicReq["top_p"] = v
-	}
-	if v, ok := req["stream"].(bool); ok {
-		anthropicReq["stream"] = v
-	}
-
-	if tools, ok := req["tools"].([]interface{}); ok {
-		anthropicReq["tools"] = convertOpenAIToolsToAnthropic(tools)
-		anthropicReq["tool_choice"] = map[string]interface{}{"type": "auto"}
-	}
-
-	data, _ := json.Marshal(anthropicReq)
-	return string(data), nil
 }
 
 // readResponseBody 读取并解压响应体

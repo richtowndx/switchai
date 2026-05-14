@@ -9,10 +9,17 @@ import (
 	"switchai/config"
 )
 
+// scannerBufferPool 用于流式响应扫描的 buffer 池，减少内存分配
+var scannerBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 64*1024) // 64KB 初始缓冲
+	},
+}
+
 // ProxyResponse 代理响应
 type ProxyResponse struct {
-	// Body 非流式响应体
-	Body string
+	// Body 非流式响应体（使用 []byte 避免与 handler 之间的额外拷贝）
+	Body []byte
 	// StreamCh 流式响应通道
 	StreamCh <-chan string
 	// ErrCh 错误通道（流式）
@@ -21,6 +28,8 @@ type ProxyResponse struct {
 	Error error
 	// IsStream 是否为流式响应
 	IsStream bool
+
+	ModelName string // 可选：模型名称（用于日志记录）
 }
 
 // CcProxy 定义统一的代理接口

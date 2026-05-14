@@ -46,8 +46,8 @@ func NewCopilotProxy(provider *config.Provider) (CcProxy, error) {
 // SendOpenAIFormat 发送 OpenAI 格式请求
 // 内部处理：模型映射 -> 格式判断 -> 发送请求
 func (p *CopilotProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *ProxyResponse {
-	// 1. 处理模型映射
-	modifiedBody := p.applyModelMapping(reqBody)
+	// 1. 处理模型映射并获取映射后的模型名
+	modifiedBody, modelName := p.applyModelMapping(reqBody)
 
 	// 2. 解析请求检查是否为流式
 	var req map[string]interface{}
@@ -55,21 +55,42 @@ func (p *CopilotProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *Pr
 	isStream, _ := req["stream"].(bool)
 
 	if isStream {
-		return p.sendCopilotStream(ctx, modifiedBody)
+		resp := p.sendCopilotStream(ctx, modifiedBody)
+		resp.ModelName = modelName
+		return resp
 	}
-	return p.sendCopilotNonStream(ctx, modifiedBody)
+	resp := p.sendCopilotNonStream(ctx, modifiedBody)
+	resp.ModelName = modelName
+	return resp
 }
 
 // SendAnthropicFormat Copilot 需要转换 Anthropic 格式
 func (p *CopilotProxy) SendAnthropicFormat(ctx context.Context, reqBody string) *ProxyResponse {
 	// 1. 转换 Anthropic -> OpenAI
-	openaiBody, err := p.convertAnthropicToOpenAI(reqBody)
+	openaiBody, modelName, err := p.convertAnthropicToOpenAI(reqBody)
 	if err != nil {
 		return &ProxyResponse{Error: err}
 	}
 
-	// 2. 调用 OpenAI 格式方法（内部会处理模型映射）
-	return p.SendOpenAIFormat(ctx, openaiBody)
+	// 2. 处理模型映射并获取映射后的模型名
+	modifiedBody, mappedName := p.applyModelMapping(openaiBody)
+	if mappedName != "" {
+		modelName = mappedName
+	}
+
+	// 3. 解析请求检查是否为流式
+	var req map[string]interface{}
+	_ = json.Unmarshal([]byte(modifiedBody), &req)
+	isStream, _ := req["stream"].(bool)
+
+	if isStream {
+		resp := p.sendCopilotStream(ctx, modifiedBody)
+		resp.ModelName = modelName
+		return resp
+	}
+	resp := p.sendCopilotNonStream(ctx, modifiedBody)
+	resp.ModelName = modelName
+	return resp
 }
 
 // Close 释放资源
@@ -87,24 +108,27 @@ func (p *CopilotProxy) Provider() *config.Provider {
 // 内部方法
 // ============================================================
 
-// applyModelMapping 处理模型映射
-func (p *CopilotProxy) applyModelMapping(reqBody string) string {
+// applyModelMapping 处理模型映射，返回映射后的请求体和模型名
+func (p *CopilotProxy) applyModelMapping(reqBody string) (string, string) {
 	var req map[string]interface{}
 	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
-		return reqBody
+		return reqBody, ""
 	}
 
+	modelName := ""
 	// 处理模型映射
 	if model, ok := req["model"].(string); ok {
+		modelName = model
 		resolved := p.provider.ResolveModel(model)
 		if resolved != model {
 			logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, p.provider.Name)
 			req["model"] = resolved
+			modelName = resolved
 		}
 	}
 
 	result, _ := json.Marshal(req)
-	return string(result)
+	return string(result), modelName
 }
 
 func (p *CopilotProxy) sendCopilotNonStream(ctx context.Context, reqBody string) *ProxyResponse {
@@ -143,7 +167,7 @@ func (p *CopilotProxy) sendCopilotNonStream(ctx context.Context, reqBody string)
 		return &ProxyResponse{Error: fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))}
 	}
 
-	return &ProxyResponse{Body: string(respBytes), IsStream: false}
+	return &ProxyResponse{Body: respBytes, IsStream: false}
 }
 
 func (p *CopilotProxy) sendCopilotStream(ctx context.Context, reqBody string) *ProxyResponse {
@@ -191,7 +215,11 @@ func (p *CopilotProxy) sendCopilotStream(ctx context.Context, reqBody string) *P
 		}
 
 		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		// 使用 buffer pool 减少 memory allocation
+		buf := scannerBufferPool.Get().([]byte)
+		defer func() { scannerBufferPool.Put(buf) }()
+		
+		scanner.Buffer(buf, 1024*1024)
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -218,10 +246,15 @@ func (p *CopilotProxy) buildURL() string {
 // 格式转换
 // ============================================================
 
-func (p *CopilotProxy) convertAnthropicToOpenAI(anthropicReq string) (string, error) {
+func (p *CopilotProxy) convertAnthropicToOpenAI(anthropicReq string) (string, string, error) {
 	var req map[string]interface{}
 	if err := json.Unmarshal([]byte(anthropicReq), &req); err != nil {
-		return "", err
+		return "", "", err
+	}
+
+	modelName := ""
+	if model, ok := req["model"].(string); ok {
+		modelName = model
 	}
 
 	openaiReq := map[string]interface{}{
@@ -241,5 +274,5 @@ func (p *CopilotProxy) convertAnthropicToOpenAI(anthropicReq string) (string, er
 	}
 
 	data, _ := json.Marshal(openaiReq)
-	return string(data), nil
+	return string(data), modelName, nil
 }
