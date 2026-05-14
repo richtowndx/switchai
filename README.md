@@ -10,6 +10,8 @@
 - 🤖 **多模型配置**：每个提供商可独立配置 default / haiku / sonnet / opus / fast 五类模型
 - 🔄 **格式自动转换**：支持 Anthropic ↔ OpenAI API 格式互转，4 种转换场景全覆盖
 - 🔌 **单提供商代理**：每个提供商可独立配置 HTTP/SOCKS5 代理地址
+- 🔀 **负载均衡**：基于客户端 IP:Port 的 FNV-1a 哈希实现客户端亲和性，确保同一客户端请求路由到同一提供商
+- 🔄 **连接复用**：TCP 连接级别的代理实例复用，减少连接开销
 - 📊 **Token 统计**：实时显示 Token 使用情况（输入/输出/总计）
 - 📜 **请求历史**：记录最近 1000 条请求，支持分页查看和详细内容展示
 - 🔑 **密钥维度统计**：按 API 密钥维度统计请求数、Token 用量和花费
@@ -313,9 +315,19 @@ sudo ./switchai-linux-amd64 -uninstall
 - **Anthropic → OpenAI**：Anthropic 格式的 `/v1/messages` 请求自动转为 OpenAI `/v1/chat/completions` 格式
 - **SSE 流式转换**：流式响应（Server-Sent Events）实时双向转换，包括 `message_start`/`content_block_delta`/`message_delta` 等事件映射
 
-## 客户端亲和性
+## 客户端亲和性与负载均衡
 
 基于客户端 IP:Port 计算 FNV-1a 哈希值，同一客户端的所有请求始终路由到同一提供商，减少多提供商切换导致的上下文丢失。
+
+**连接级代理管理**：
+- TCP 连接级别的 CcProxy 实例复用，每个 TCP 连接对应一个代理实例
+- 空闲连接自动清理（默认 5 分钟无活动）
+- 支持连接级别的 Provider 故障切换
+
+**连接跟踪与统计**：
+- 实时跟踪连接流量（BytesRead/BytesWrite）
+- 连接建立/关闭日志记录
+- 按 Provider 分组统计活动连接数
 
 ## 服务器密钥管理
 
@@ -384,8 +396,11 @@ switchai/
 │   ├── ccproxy_handler.go  # CCProxy HTTP 处理器
 │   ├── anthropic_proxy.go  # Anthropic 原生协议代理
 │   ├── openai_proxy.go    # OpenAI 协议代理
-│   ├── copilot_proxy.go   # Copilot 专用代理
-│   ├── format_converter.go # 格式转换核心
+│   ├── copilot_proxy.go    # Copilot 专用代理
+│   ├── conn_proxy_manager.go # 连接级代理管理（TCP 连接复用）
+│   ├── tracked_conn.go     # 连接跟踪与流量统计
+│   ├── format_converter.go # 格式转换核心（已在 proxy.go 实现）
+│   ├── format_helper.go    # 格式转换辅助函数
 │   ├── request_converter.go # 请求格式转换
 │   ├── response_converter.go # 响应格式转换
 │   └── *.go                # 其他辅助模块
