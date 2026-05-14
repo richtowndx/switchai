@@ -7,9 +7,9 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"io"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,10 +21,9 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
-const maxProviderRetries = 1  // 简化：只尝试一次，不重试
+const maxProviderRetries = 1 // 简化：只尝试一次，不重试
 
 // RegisterRoutes 注册所有代理路由
 // 在路由注册时就区分服务类型：Anthropic/OpenAI 格式使用 /v1/ 前缀，Copilot 使用 /copilot/ 或 /chat/completions
@@ -301,8 +300,8 @@ func hashClientRemote(remoteAddr string) uint64 {
 
 // handlerConfig 封装 handler 的格式配置
 type handlerConfig struct {
-	isIncomingOpenAIFormat bool // 请求是否为 OpenAI 格式
-	isCopilot              bool // 是否为 Copilot 处理器
+	isIncomingOpenAIFormat bool   // 请求是否为 OpenAI 格式
+	isCopilot              bool   // 是否为 Copilot 处理器
 	formatName             string // 格式名称（用于日志）
 }
 
@@ -312,7 +311,7 @@ type handlerConfig struct {
 
 // openAIHandler 处理 OpenAI 格式的请求
 func openAIHandler(c *gin.Context) {
-	baseProxyHandler(c, &handlerConfig{
+	baseProxyHandlerWithCcProxy(c, &handlerConfig{
 		isIncomingOpenAIFormat: true,
 		isCopilot:              false,
 		formatName:             "OpenAI",
@@ -321,7 +320,7 @@ func openAIHandler(c *gin.Context) {
 
 // anthropicHandler 处理 Anthropic/Claude 格式的请求
 func anthropicHandler(c *gin.Context) {
-	baseProxyHandler(c, &handlerConfig{
+	baseProxyHandlerWithCcProxy(c, &handlerConfig{
 		isIncomingOpenAIFormat: false,
 		isCopilot:              false,
 		formatName:             "Anthropic",
@@ -330,112 +329,11 @@ func anthropicHandler(c *gin.Context) {
 
 // copilotHandler 处理 Copilot 格式的请求
 func copilotHandler(c *gin.Context) {
-	baseProxyHandler(c, &handlerConfig{
+	baseProxyHandlerWithCcProxy(c, &handlerConfig{
 		isIncomingOpenAIFormat: false, // Copilot 使用类 Anthropic 格式
 		isCopilot:              true,
 		formatName:             "Copilot",
 	})
-}
-
-// ============================================================
-// 公共 Proxy Handler 逻辑
-// ============================================================
-
-// baseProxyHandler 公共的代理处理逻辑
-// 所有特定格式的 handler 都调用此函数，传入各自的格式配置
-func baseProxyHandler(c *gin.Context, cfg *handlerConfig) {
-	startTime := time.Now()
-	requestID := uuid.New().String()
-
-	// 1. 认证
-	keyID, clientIP, ok := authenticate(c)
-	if !ok {
-		return
-	}
-
-	// 2. 读取请求体
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
-		return
-	}
-
-	// 3. 基于客户端 IP:PORT 计算 hash
-	clientHash := hashClientRemote(c.Request.RemoteAddr)
-	logger.Info("Incoming request: ID=%s, Method=%s, Path=%s, Format=%s, ClientHash=%d",
-		requestID, c.Request.Method, c.Request.URL.Path, cfg.formatName, clientHash)
-
-	// 5. 重试：最多尝试 maxProviderRetries 个不同 provider
-	var lastErr error
-	for attempt := 0; attempt < maxProviderRetries; attempt++ {
-		provider := config.GetConfig().GetClientHashedProvider(clientHash, attempt)
-		if provider == nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "No provider configured"})
-			return
-		}
-
-		logger.Info("📡 Provider attempt %d/%d: %s (format: isOpenAI=%v, isCopilot=%v)",
-			attempt+1, maxProviderRetries, provider.Name, provider.IsOpenAIFormat, provider.IsCopilot())
-
-		// 处理请求体（模型解析 + 格式转换）
-		processed, err := processRequestBody(bodyBytes, provider, cfg.isIncomingOpenAIFormat,
-			c.Request.URL.Path, c.Request.URL.RawQuery)
-		if err != nil {
-			logger.Error("❌ Failed to process request body: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process request"})
-			return
-		}
-
-		logger.Info("📡 代理转发 - Provider: %s, BaseURL: %s → Target: %s",
-			provider.Name, provider.BaseURL, processed.TargetURL)
-
-		// 解析 Copilot token（如果是 Copilot 提供商，自动刷新过期 token）
-		copilotToken := ""
-		if provider.IsCopilot() {
-			copilotToken = RefreshCopilotToken(provider)
-			if copilotToken == "" {
-				copilotToken = ResolveCopilotToken(provider)
-			}
-			if copilotToken == "" {
-				logger.Error("❌ Copilot 提供商 %s 缺少有效的 Copilot Token", provider.Name)
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "Copilot token is not available. Please authorize GitHub Copilot in the web interface first."})
-				return
-			}
-		}
-
-		// 发送请求到上游
-		resp, err := sendRequest(c.Request.Method, processed.TargetURL,
-			c.Request.Header, processed.BodyBytes, provider, copilotToken)
-		if err != nil {
-			lastErr = err
-			if _, ok := err.(*retryableError); ok {
-				logger.Info("⚠️ Provider %s 返回可重试错误 (attempt %d/%d)，尝试下一个 provider",
-					provider.Name, attempt+1, maxProviderRetries)
-				continue
-			}
-			logger.Error("❌ Provider %s 连接失败: %v", provider.Name, err)
-			return
-		}
-		defer resp.Body.Close()
-
-		logger.Info("📥 收到响应 - Provider: %s, Status: %d", provider.Name, resp.StatusCode)
-
-		// 处理响应
-		if processed.IsStream {
-			handleStreamResponse(c, resp, provider, requestID, startTime,
-				c.Request.Method, c.Request.URL.Path, processed.ModifiedRequestBody,
-				c.Request.Header, processed.RequestedModel, keyID, clientIP, cfg.isIncomingOpenAIFormat)
-		} else {
-			handleNonStreamResponse(c, resp, provider, requestID, startTime,
-				c.Request.Method, c.Request.URL.Path, processed.ModifiedRequestBody,
-				c.Request.Header, processed.RequestedModel, keyID, clientIP, cfg.isIncomingOpenAIFormat)
-		}
-		return
-	}
-
-	// 所有 provider 都失败
-	logger.Error("❌ 所有 provider 均失败 (尝试 %d 次): %v", maxProviderRetries, lastErr)
-	c.JSON(http.StatusBadGateway, gin.H{"error": "All providers failed after retries"})
 }
 
 // ============================================================
@@ -921,7 +819,7 @@ func convertClaudeUserMsg(content interface{}) []interface{} {
 				}
 				if url != "" {
 					contentParts = append(contentParts, map[string]interface{}{
-						"type": "image_url",
+						"type":      "image_url",
 						"image_url": map[string]interface{}{"url": url},
 					})
 				}

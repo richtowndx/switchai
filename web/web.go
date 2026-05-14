@@ -383,6 +383,11 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+	// 设置握手超时
+	HandshakeTimeout: 30 * time.Second,
+	// 设置读写缓冲区大小
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
 }
 
 func handleWebSocket(c *gin.Context) {
@@ -395,14 +400,50 @@ func handleWebSocket(c *gin.Context) {
 	stats.GetStats().AddClient(conn)
 	log.Println("New WebSocket client connected")
 
+	// 设置 ping/pong 处理器，保持连接活跃
+	conn.SetPingHandler(func(appData string) error {
+		// 响应 pong 消息
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+
+	// 设置读写超时（如果 90 秒内没有收到任何消息，则超时）
+	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		// 收到 pong 时，延长读超时
+		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return nil
+	})
+
 	// 发送当前统计数据
 	summary := stats.GetStats().GetSummary()
 	if err := conn.WriteJSON(summary); err != nil {
 		log.Printf("Error sending initial stats: %v", err)
 	}
 
+	// 启动心跳协程，每 30 秒发送一次 ping
+	stopHeartbeat := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// 发送 ping 消息保持连接活跃
+				if err := conn.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
+					log.Printf("WebSocket ping error: %v", err)
+					return
+				}
+			case <-stopHeartbeat:
+				return
+			}
+		}
+	}()
+
 	// 保持连接，等待客户端断开
-	defer stats.GetStats().RemoveClient(conn)
+	defer func() {
+		close(stopHeartbeat)
+		stats.GetStats().RemoveClient(conn)
+	}()
 
 	for {
 		_, _, err := conn.ReadMessage()
@@ -423,14 +464,50 @@ func handleHistoryWebSocket(c *gin.Context) {
 	history.AddClient(conn)
 	log.Println("New history WebSocket client connected")
 
+	// 设置 ping/pong 处理器，保持连接活跃
+	conn.SetPingHandler(func(appData string) error {
+		// 响应 pong 消息
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+
+	// 设置读写超时（如果 90 秒内没有收到任何消息，则超时）
+	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		// 收到 pong 时，延长读超时
+		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		return nil
+	})
+
 	// 发送最近 20 条历史记录
 	records, total := history.GetRecordsSummary(1, 20)
 	if err := conn.WriteJSON(gin.H{"type": "history", "records": records, "total": total}); err != nil {
 		log.Printf("Error sending initial history: %v", err)
 	}
 
+	// 启动心跳协程，每 30 秒发送一次 ping
+	stopHeartbeat := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// 发送 ping 消息保持连接活跃
+				if err := conn.WriteMessage(websocket.PingMessage, []byte("keepalive")); err != nil {
+					log.Printf("History WebSocket ping error: %v", err)
+					return
+				}
+			case <-stopHeartbeat:
+				return
+			}
+		}
+	}()
+
 	// 保持连接，等待客户端断开
-	defer history.RemoveClient(conn)
+	defer func() {
+		close(stopHeartbeat)
+		history.RemoveClient(conn)
+	}()
 
 	for {
 		_, _, err := conn.ReadMessage()

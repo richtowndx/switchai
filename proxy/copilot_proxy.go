@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"switchai/config"
+	"switchai/logger"
 )
 
 func init() {
@@ -18,7 +19,6 @@ func init() {
 }
 
 // CopilotProxy 实现 Copilot API 代理
-// Copilot 使用 OpenAI 兼容的 API 格式，但需要特殊的认证 headers
 type CopilotProxy struct {
 	provider *config.Provider
 	client   *http.Client
@@ -33,7 +33,7 @@ func NewCopilotProxy(provider *config.Provider) (CcProxy, error) {
 	return &CopilotProxy{
 		provider: provider,
 		client: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 600 * time.Second,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
@@ -43,139 +43,33 @@ func NewCopilotProxy(provider *config.Provider) (CcProxy, error) {
 	}, nil
 }
 
-// SendMessage 发送非流式消息请求
-func (p *CopilotProxy) SendMessage(ctx context.Context, req *UnifiedRequest) (*UnifiedResponse, error) {
-	// 获取/刷新 Copilot token
-	copilotToken := RefreshCopilotToken(p.provider)
-	if copilotToken == "" {
-		return nil, fmt.Errorf("failed to get copilot token")
-	}
+// SendOpenAIFormat 发送 OpenAI 格式请求
+// 内部处理：模型映射 -> 格式判断 -> 发送请求
+func (p *CopilotProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *ProxyResponse {
+	// 1. 处理模型映射
+	modifiedBody := p.applyModelMapping(reqBody)
 
-	// 构建 OpenAI 格式请求体
-	body := map[string]interface{}{
-		"model":      p.resolveModel(req.Model),
-		"messages":   p.convertMessages(req.Messages),
-		"max_tokens": req.MaxTokens,
-	}
+	// 2. 解析请求检查是否为流式
+	var req map[string]interface{}
+	_ = json.Unmarshal([]byte(modifiedBody), &req)
+	isStream, _ := req["stream"].(bool)
 
-	if req.Temperature > 0 {
-		body["temperature"] = req.Temperature
+	if isStream {
+		return p.sendCopilotStream(ctx, modifiedBody)
 	}
-	if req.TopP > 0 {
-		body["top_p"] = req.TopP
-	}
-	if len(req.Tools) > 0 {
-		body["tools"] = p.convertTools(req.Tools)
-		body["tool_choice"] = "auto"
-	}
-
-	// 发送请求
-	resp, err := p.doRequest(ctx, body, false, copilotToken)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// 解析响应 (OpenAI 格式)
-	var result openAIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("api error: %s", result.Error.Message)
-	}
-
-	return p.convertToUnifiedResponse(&result), nil
+	return p.sendCopilotNonStream(ctx, modifiedBody)
 }
 
-// SendMessageStream 发送流式消息请求
-func (p *CopilotProxy) SendMessageStream(ctx context.Context, req *UnifiedRequest) (<-chan *StreamChunk, <-chan error) {
-	chunkCh := make(chan *StreamChunk, 16)
-	errCh := make(chan error, 1)
+// SendAnthropicFormat Copilot 需要转换 Anthropic 格式
+func (p *CopilotProxy) SendAnthropicFormat(ctx context.Context, reqBody string) *ProxyResponse {
+	// 1. 转换 Anthropic -> OpenAI
+	openaiBody, err := p.convertAnthropicToOpenAI(reqBody)
+	if err != nil {
+		return &ProxyResponse{Error: err}
+	}
 
-	go func() {
-		defer close(chunkCh)
-		defer close(errCh)
-
-		// 获取/刷新 Copilot token
-		copilotToken := RefreshCopilotToken(p.provider)
-		if copilotToken == "" {
-			errCh <- fmt.Errorf("failed to get copilot token")
-			return
-		}
-
-		// 构建 OpenAI 格式请求体
-		body := map[string]interface{}{
-			"model":      p.resolveModel(req.Model),
-			"messages":   p.convertMessages(req.Messages),
-			"max_tokens": req.MaxTokens,
-			"stream":     true,
-		}
-
-		if req.Temperature > 0 {
-			body["temperature"] = req.Temperature
-		}
-		if req.TopP > 0 {
-			body["top_p"] = req.TopP
-		}
-		if len(req.Tools) > 0 {
-			body["tools"] = p.convertTools(req.Tools)
-			body["tool_choice"] = "auto"
-		}
-
-		// 发送请求
-		resp, err := p.doRequest(ctx, body, true, copilotToken)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			var errResp openAIResponse
-			json.NewDecoder(resp.Body).Decode(&errResp)
-			errCh <- fmt.Errorf("api error: %s", errResp.Error.Message)
-			return
-		}
-
-		// 解析 SSE 流 (OpenAI 格式)
-		scanner := bufio.NewScanner(resp.Body)
-		var currentToolUse *ToolUse
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-
-			data := strings.TrimPrefix(line, "data: ")
-			if data == "[DONE]" {
-				chunkCh <- &StreamChunk{
-					Type: ChunkTypeUsage,
-					Usage: &Usage{},
-					Done:  true,
-				}
-				return
-			}
-
-			var chunk openAIStreamChunk
-			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				continue
-			}
-
-			outChunk := p.convertStreamChunk(&chunk, &currentToolUse)
-			if outChunk != nil {
-				chunkCh <- outChunk
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			errCh <- fmt.Errorf("scan stream: %w", err)
-		}
-	}()
-
-	return chunkCh, errCh
+	// 2. 调用 OpenAI 格式方法（内部会处理模型映射）
+	return p.SendOpenAIFormat(ctx, openaiBody)
 }
 
 // Close 释放资源
@@ -190,288 +84,162 @@ func (p *CopilotProxy) Provider() *config.Provider {
 }
 
 // ============================================================
-// 转换函数
+// 内部方法
 // ============================================================
 
-func (p *CopilotProxy) convertMessages(messages []Message) []map[string]interface{} {
-	result := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		result[i] = map[string]interface{}{
-			"role": msg.Role,
-		}
+// applyModelMapping 处理模型映射
+func (p *CopilotProxy) applyModelMapping(reqBody string) string {
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
+		return reqBody
+	}
 
-		if msg.ToolResult != nil {
-			result[i]["content"] = msg.ToolResult.Content
-			result[i]["tool_call_id"] = msg.ToolResult.ToolUseID
-		} else if len(msg.ContentBlocks) > 0 {
-			content := make([]map[string]interface{}, len(msg.ContentBlocks))
-			for j, block := range msg.ContentBlocks {
-				if block.Type == "text" {
-					content[j] = map[string]interface{}{
-						"type": "text",
-						"text": block.Text,
-					}
-				} else if block.Type == "image" {
-					content[j] = map[string]interface{}{
-						"type": "image_url",
-						"image_url": map[string]interface{}{
-							"url": block.Source.Data,
-						},
-					}
-				}
-			}
-			result[i]["content"] = content
-		} else {
-			result[i]["content"] = msg.Content
+	// 处理模型映射
+	if model, ok := req["model"].(string); ok {
+		resolved := p.provider.ResolveModel(model)
+		if resolved != model {
+			logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, p.provider.Name)
+			req["model"] = resolved
 		}
 	}
-	return result
+
+	result, _ := json.Marshal(req)
+	return string(result)
 }
 
-func (p *CopilotProxy) convertTools(tools []Tool) []map[string]interface{} {
-	result := make([]map[string]interface{}, len(tools))
-	for i, tool := range tools {
-		result[i] = map[string]interface{}{
-			"type": "function",
-			"function": map[string]interface{}{
-				"name":        tool.Name,
-				"description": tool.Description,
-				"parameters":  tool.InputSchema,
-			},
-		}
-	}
-	return result
-}
-
-func (p *CopilotProxy) resolveModel(model string) string {
-	// 首先归一化 Claude 模型 ID
-	normalized := NormalizeCopilotModelID(model)
-	// 然后解析为 Copilot 兼容的模型
-	return ResolveCopilotModel(normalized)
-}
-
-func (p *CopilotProxy) convertToUnifiedResponse(resp *openAIResponse) *UnifiedResponse {
-	result := &UnifiedResponse{
-		ID:      resp.ID,
-		Model:   resp.Model,
-		Role:    "assistant",
-		Content: "",
-		ContentBlocks: make([]ContentBlock, 0),
+func (p *CopilotProxy) sendCopilotNonStream(ctx context.Context, reqBody string) *ProxyResponse {
+	// 获取 Copilot token
+	copilotToken := RefreshCopilotToken(p.provider)
+	if copilotToken == "" {
+		return &ProxyResponse{Error: fmt.Errorf("failed to get Copilot token")}
 	}
 
-	if len(resp.Choices) > 0 {
-		choice := resp.Choices[0]
-		if choice.Message.Content != nil {
-			result.Content = *choice.Message.Content
-		}
-
-		if len(choice.Message.ToolCalls) > 0 {
-			for _, tc := range choice.Message.ToolCalls {
-				var input map[string]interface{}
-				if tc.Function.Arguments != "" {
-					json.Unmarshal([]byte(tc.Function.Arguments), &input)
-				}
-				result.ToolUse = &ToolUse{
-					ID:       tc.ID,
-					Name:     tc.Function.Name,
-					Input:    input,
-					Metadata: map[string]string{},
-				}
-			}
-		}
-
-		result.StopReason = string(choice.FinishReason)
-	}
-
-	if resp.Usage.TotalTokens > 0 {
-		result.Usage = &Usage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-		}
-	}
-
-	return result
-}
-
-func (p *CopilotProxy) convertStreamChunk(chunk *openAIStreamChunk, currentToolUse **ToolUse) *StreamChunk {
-	if len(chunk.Choices) == 0 {
-		return nil
-	}
-
-	choice := chunk.Choices[0]
-	delta := choice.Delta
-
-	// 文本内容
-	if delta.Content != nil && *delta.Content != "" {
-		return &StreamChunk{
-			Type:  ChunkTypeContent,
-			Delta: *delta.Content,
-		}
-	}
-
-	// 工具调用
-	if len(delta.ToolCalls) > 0 {
-		for _, tc := range delta.ToolCalls {
-			if tc.Index != nil && *tc.Index == 0 {
-				if tc.ID != nil && *tc.ID != "" {
-					*currentToolUse = &ToolUse{
-						ID:        *tc.ID,
-						Name:      "",
-						Input:     make(map[string]interface{}),
-						Metadata:  make(map[string]string),
-					}
-					if tc.Function.Name != nil {
-						(*currentToolUse).Name = *tc.Function.Name
-					}
-					return &StreamChunk{
-						Type:    ChunkTypeToolUseStart,
-						ToolUse: *currentToolUse,
-					}
-				}
-
-				// 工具调用参数增量
-				if tc.Function.Arguments != nil && *tc.Function.Arguments != "" && *currentToolUse != nil {
-					return &StreamChunk{
-						Type: ChunkTypeToolUseDelta,
-					}
-				}
-			}
-		}
-	}
-
-	// 流结束
-	if choice.FinishReason != "" {
-		return &StreamChunk{
-			Type: ChunkTypeUsage,
-			Usage: &Usage{},
-			Done:  true,
-		}
-	}
-
-	return nil
-}
-
-func (p *CopilotProxy) doRequest(ctx context.Context, body map[string]interface{}, stream bool, copilotToken string) (*http.Response, error) {
-	jsonBody, err := json.Marshal(body)
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	targetURL := CopilotTargetURL(p.provider)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, strings.NewReader(string(jsonBody)))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return &ProxyResponse{Error: fmt.Errorf("create request: %w", err)}
 	}
 
 	// 注入 Copilot headers
-	req.Header = InjectCopilotHeaders(req.Header, copilotToken)
+	for k, v := range InjectCopilotHeaders(nil, copilotToken) {
+		for _, val := range v {
+			req.Header.Add(k, val)
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-	if stream {
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return &ProxyResponse{Error: fmt.Errorf("send request: %w", err)}
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := readResponseBody(resp)
+	if err != nil {
+		return &ProxyResponse{Error: err}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &ProxyResponse{Error: fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))}
+	}
+
+	return &ProxyResponse{Body: string(respBytes), IsStream: false}
+}
+
+func (p *CopilotProxy) sendCopilotStream(ctx context.Context, reqBody string) *ProxyResponse {
+	ch := make(chan string, 16)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(ch)
+		defer close(errCh)
+
+		// 获取 Copilot token
+		copilotToken := RefreshCopilotToken(p.provider)
+		if copilotToken == "" {
+			errCh <- fmt.Errorf("failed to get Copilot token")
+			return
+		}
+
+		baseURL := p.buildURL()
+		req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
+		if err != nil {
+			errCh <- fmt.Errorf("create request: %w", err)
+			return
+		}
+
+		// 注入 Copilot headers
+		for k, v := range InjectCopilotHeaders(nil, copilotToken) {
+			for _, val := range v {
+				req.Header.Add(k, val)
+			}
+		}
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "text/event-stream")
-	}
 
-	return p.client.Do(req)
-}
+		resp, err := p.client.Do(req)
+		if err != nil {
+			errCh <- fmt.Errorf("send request: %w", err)
+			return
+		}
+		defer resp.Body.Close()
 
-// ============================================================
-// 流式响应转发
-// ============================================================
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			errCh <- fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(body))
+			return
+		}
 
-// ForwardStreamToWriter 将流式响应转发到指定的 writer
-// 用于 HTTP handler 直接转发 SSE 流
-func ForwardStreamToWriter(ctx context.Context, w io.Writer, chunkCh <-chan *StreamChunk, errCh <-chan error, format string) error {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		return fmt.Errorf("writer is not a http.Flusher")
-	}
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-
-		case err, ok := <-errCh:
-			if !ok {
-				// errCh 已关闭，正常结束
-				return nil
-			}
-			return err
-
-		case chunk, ok := <-chunkCh:
-			if !ok {
-				// chunkCh 已关闭，正常结束
-				return nil
-			}
-
-			// 根据目标格式转换 chunk
-			var data []byte
-			var err error
-
-			if format == "openai" || format == "copilot" {
-				data, err = json.Marshal(chunkToOpenAIFormat(chunk))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				ch <- "\n"
 			} else {
-				data, err = json.Marshal(chunkToAnthropicFormat(chunk))
+				ch <- line + "\n"
 			}
-
-			if err != nil {
-				return fmt.Errorf("marshal chunk: %w", err)
-			}
-
-			// 写入 SSE 格式
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
-			flusher.Flush()
 		}
-	}
+
+		if err := scanner.Err(); err != nil {
+			errCh <- fmt.Errorf("scan stream: %w", err)
+		}
+	}()
+
+	return &ProxyResponse{StreamCh: ch, ErrCh: errCh, IsStream: true}
 }
 
-// chunkToOpenAIFormat 将 StreamChunk 转换为 OpenAI 格式
-func chunkToOpenAIFormat(chunk *StreamChunk) map[string]interface{} {
-	result := map[string]interface{}{
-		"id":      "chatcmpl-" + fmt.Sprintf("%d", time.Now().UnixNano()),
-		"object":  "chat.completion.chunk",
-		"created": time.Now().Unix(),
-		"model":   "gpt-4o",
-		"choices": []map[string]interface{}{
-			{
-				"index": 0,
-				"delta": map[string]interface{}{
-					"content": chunk.Delta,
-				},
-				"finish_reason": nil,
-			},
-		},
-	}
-
-	if chunk.Done {
-		result["choices"] = []map[string]interface{}{
-			{
-				"index":         0,
-				"delta":         map[string]interface{}{},
-				"finish_reason": "stop",
-			},
-		}
-	}
-
-	return result
+func (p *CopilotProxy) buildURL() string {
+	return CopilotTargetURL(p.provider)
 }
 
-// chunkToAnthropicFormat 将 StreamChunk 转换为 Anthropic 格式
-func chunkToAnthropicFormat(chunk *StreamChunk) map[string]interface{} {
-	result := map[string]interface{}{
-		"type": "content_block_delta",
-		"index": 0,
-		"delta": map[string]interface{}{
-			"type": "text_delta",
-			"text": chunk.Delta,
-		},
+// ============================================================
+// 格式转换
+// ============================================================
+
+func (p *CopilotProxy) convertAnthropicToOpenAI(anthropicReq string) (string, error) {
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(anthropicReq), &req); err != nil {
+		return "", err
 	}
 
-	if chunk.Done {
-		result = map[string]interface{}{
-			"type": "message_stop",
-		}
+	openaiReq := map[string]interface{}{
+		"model":      req["model"],
+		"max_tokens": req["max_tokens"],
+		"messages":   convertAnthropicMessagesToOpenAI(req["messages"], req["system"]),
 	}
 
-	return result
+	if v, ok := req["temperature"].(float64); ok && v > 0 {
+		openaiReq["temperature"] = v
+	}
+	if v, ok := req["top_p"].(float64); ok && v > 0 {
+		openaiReq["top_p"] = v
+	}
+	if v, ok := req["stream"].(bool); ok {
+		openaiReq["stream"] = v
+	}
+
+	data, _ := json.Marshal(openaiReq)
+	return string(data), nil
 }

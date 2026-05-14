@@ -230,21 +230,23 @@ func (t *ConnectionTracker) UpdateConnProvider(connID string, provider *config.P
 func (t *ConnectionTracker) PrintStats() {
 	var activeCount int
 	var totalBytesRead, totalBytesWrite int64
+	var conn_str string
 
 	t.connections.Range(func(key, value interface{}) bool {
 		info := value.(*ConnectionInfo)
 		activeCount++
 		totalBytesRead += info.BytesRead.Load()
 		totalBytesWrite += info.BytesWrite.Load()
+		conn_str += fmt.Sprintf("  - %s: %s -> provider: %s (isOpenAI: %v)\n",
+			info.ID, info.RemoteAddr, info.Provider().Name, info.Provider().IsOpenAIFormat)
 		return true
 	})
 
-	fmt.Printf("[STATS] Active: %d, Total: %d, Read: %s, Write: %s\n",
+	fmt.Printf("[STATS] Active: %d, Total: %d, Read: %s, Write: %s\n%s",
 		activeCount,
 		t.totalConns.Load(),
 		formatBytes(totalBytesRead),
-		formatBytes(totalBytesWrite),
-	)
+		formatBytes(totalBytesWrite), conn_str)
 }
 
 // CleanupStaleConnections 清理超时连接

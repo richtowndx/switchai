@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"switchai/config"
+	"switchai/logger"
 )
 
 func init() {
@@ -24,10 +26,14 @@ type OpenAIProxy struct {
 
 // NewOpenAIProxy 创建 OpenAI 代理实例
 func NewOpenAIProxy(provider *config.Provider) (CcProxy, error) {
+	if !provider.IsOpenAIFormat {
+		return nil, fmt.Errorf("provider %s is not OpenAI format", provider.Name)
+	}
+
 	return &OpenAIProxy{
 		provider: provider,
 		client: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 600 * time.Second,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
@@ -37,126 +43,34 @@ func NewOpenAIProxy(provider *config.Provider) (CcProxy, error) {
 	}, nil
 }
 
-// SendMessage 发送非流式消息请求
-func (p *OpenAIProxy) SendMessage(ctx context.Context, req *UnifiedRequest) (*UnifiedResponse, error) {
-	// 构建请求体
-	body := map[string]interface{}{
-		"model":      req.Model,
-		"messages":   p.convertMessages(req.Messages),
-		"max_tokens": req.MaxTokens,
-	}
+// SendOpenAIFormat 发送 OpenAI 格式请求
+// 内部处理：模型映射 -> 格式判断 -> 发送请求
+func (p *OpenAIProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *ProxyResponse {
+	// 1. 处理模型映射
+	modifiedBody := p.applyModelMapping(reqBody)
 
-	if req.Temperature > 0 {
-		body["temperature"] = req.Temperature
-	}
-	if req.TopP > 0 {
-		body["top_p"] = req.TopP
-	}
-	if len(req.Tools) > 0 {
-		body["tools"] = p.convertTools(req.Tools)
-		body["tool_choice"] = "auto"
-	}
+	// 2. 解析请求检查是否为流式
+	var req map[string]interface{}
+	_ = json.Unmarshal([]byte(modifiedBody), &req)
+	isStream, _ := req["stream"].(bool)
 
-	// 发送请求
-	resp, err := p.doRequest(ctx, body, false)
-	if err != nil {
-		return nil, err
+	if isStream {
+		return p.sendOpenAIStream(ctx, modifiedBody)
 	}
-	defer resp.Body.Close()
-
-	// 解析响应
-	var result openAIResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("api error: %s", result.Error.Message)
-	}
-
-	return p.convertToUnifiedResponse(&result), nil
+	return p.sendOpenAINonStream(ctx, modifiedBody)
 }
 
-// SendMessageStream 发送流式消息请求
-func (p *OpenAIProxy) SendMessageStream(ctx context.Context, req *UnifiedRequest) (<-chan *StreamChunk, <-chan error) {
-	chunkCh := make(chan *StreamChunk, 16)
-	errCh := make(chan error, 1)
+// SendAnthropicFormat 发送 Anthropic 格式请求
+// 内部处理：格式转换 -> 模型映射 -> 发送请求
+func (p *OpenAIProxy) SendAnthropicFormat(ctx context.Context, reqBody string) *ProxyResponse {
+	// 1. 转换 Anthropic -> OpenAI
+	openaiBody, err := p.convertAnthropicToOpenAI(reqBody)
+	if err != nil {
+		return &ProxyResponse{Error: err}
+	}
 
-	go func() {
-		defer close(chunkCh)
-		defer close(errCh)
-
-		// 构建请求体
-		body := map[string]interface{}{
-			"model":      req.Model,
-			"messages":   p.convertMessages(req.Messages),
-			"max_tokens": req.MaxTokens,
-			"stream":     true,
-		}
-
-		if req.Temperature > 0 {
-			body["temperature"] = req.Temperature
-		}
-		if req.TopP > 0 {
-			body["top_p"] = req.TopP
-		}
-		if len(req.Tools) > 0 {
-			body["tools"] = p.convertTools(req.Tools)
-			body["tool_choice"] = "auto"
-		}
-
-		// 发送请求
-		resp, err := p.doRequest(ctx, body, true)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			var errResp openAIResponse
-			json.NewDecoder(resp.Body).Decode(&errResp)
-			errCh <- fmt.Errorf("api error: %s", errResp.Error.Message)
-			return
-		}
-
-		// 解析 SSE 流
-		scanner := bufio.NewScanner(resp.Body)
-		var currentToolUse *ToolUse
-
-		for scanner.Scan() {
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-
-			data := strings.TrimPrefix(line, "data: ")
-			if data == "[DONE]" {
-				chunkCh <- &StreamChunk{
-					Type: ChunkTypeUsage,
-					Usage: &Usage{},
-					Done:  true,
-				}
-				return
-			}
-
-			var chunk openAIStreamChunk
-			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				continue
-			}
-
-			outChunk := p.convertStreamChunk(&chunk, &currentToolUse)
-			if outChunk != nil {
-				chunkCh <- outChunk
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			errCh <- fmt.Errorf("scan stream: %w", err)
-		}
-	}()
-
-	return chunkCh, errCh
+	// 2. 调用 OpenAI 格式方法（内部会处理模型映射）
+	return p.SendOpenAIFormat(ctx, openaiBody)
 }
 
 // Close 释放资源
@@ -171,264 +85,154 @@ func (p *OpenAIProxy) Provider() *config.Provider {
 }
 
 // ============================================================
-// 转换函数
+// 内部方法
 // ============================================================
 
-func (p *OpenAIProxy) convertMessages(messages []Message) []map[string]interface{} {
-	result := make([]map[string]interface{}, len(messages))
-	for i, msg := range messages {
-		result[i] = map[string]interface{}{
-			"role": msg.Role,
-		}
+// applyModelMapping 处理模型映射
+func (p *OpenAIProxy) applyModelMapping(reqBody string) string {
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
+		return reqBody
+	}
 
-		if msg.ToolResult != nil {
-			result[i]["content"] = msg.ToolResult.Content
-			result[i]["tool_call_id"] = msg.ToolResult.ToolUseID
-		} else if len(msg.ContentBlocks) > 0 {
-			content := make([]map[string]interface{}, len(msg.ContentBlocks))
-			for j, block := range msg.ContentBlocks {
-				if block.Type == "text" {
-					content[j] = map[string]interface{}{
-						"type": "text",
-						"text": block.Text,
-					}
-				} else if block.Type == "image" {
-					content[j] = map[string]interface{}{
-						"type": "image_url",
-						"image_url": map[string]interface{}{
-							"url": block.Source.Data,
-						},
-					}
-				}
-			}
-			result[i]["content"] = content
-		} else {
-			result[i]["content"] = msg.Content
+	// 处理模型映射
+	if model, ok := req["model"].(string); ok {
+		resolved := p.provider.ResolveModel(model)
+		if resolved != model {
+			logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, p.provider.Name)
+			req["model"] = resolved
 		}
 	}
-	return result
+
+	result, _ := json.Marshal(req)
+	return string(result)
 }
 
-func (p *OpenAIProxy) convertTools(tools []Tool) []map[string]interface{} {
-	result := make([]map[string]interface{}, len(tools))
-	for i, tool := range tools {
-		result[i] = map[string]interface{}{
-			"type": "function",
-			"function": map[string]interface{}{
-				"name":        tool.Name,
-				"description": tool.Description,
-				"parameters":  tool.InputSchema,
-			},
-		}
-	}
-	return result
-}
-
-func (p *OpenAIProxy) convertToUnifiedResponse(resp *openAIResponse) *UnifiedResponse {
-	result := &UnifiedResponse{
-		ID:      resp.ID,
-		Model:   resp.Model,
-		Role:    "assistant",
-		Content: "",
-		ContentBlocks: make([]ContentBlock, 0),
-	}
-
-	if len(resp.Choices) > 0 {
-		choice := resp.Choices[0]
-		if choice.Message.Content != nil {
-			result.Content = *choice.Message.Content
-		}
-
-		if len(choice.Message.ToolCalls) > 0 {
-			for _, tc := range choice.Message.ToolCalls {
-				var input map[string]interface{}
-				if tc.Function.Arguments != "" {
-					json.Unmarshal([]byte(tc.Function.Arguments), &input)
-				}
-				result.ToolUse = &ToolUse{
-					ID:       tc.ID,
-					Name:     tc.Function.Name,
-					Input:    input,
-					Metadata: map[string]string{},
-				}
-			}
-		}
-
-		result.StopReason = string(choice.FinishReason)
-	}
-
-	if resp.Usage.TotalTokens > 0 {
-		result.Usage = &Usage{
-			InputTokens:  resp.Usage.PromptTokens,
-			OutputTokens: resp.Usage.CompletionTokens,
-		}
-	}
-
-	return result
-}
-
-func (p *OpenAIProxy) convertStreamChunk(chunk *openAIStreamChunk, currentToolUse **ToolUse) *StreamChunk {
-	if len(chunk.Choices) == 0 {
-		return nil
-	}
-
-	choice := chunk.Choices[0]
-	delta := choice.Delta
-
-	// 文本内容
-	if delta.Content != nil && *delta.Content != "" {
-		return &StreamChunk{
-			Type:  ChunkTypeContent,
-			Delta: *delta.Content,
-		}
-	}
-
-	// 工具调用
-	if len(delta.ToolCalls) > 0 {
-		for _, tc := range delta.ToolCalls {
-			if tc.Index != nil && *tc.Index == 0 {
-				if tc.ID != nil && *tc.ID != "" {
-					*currentToolUse = &ToolUse{
-						ID:        *tc.ID,
-						Name:      "",
-						Input:     make(map[string]interface{}),
-						Metadata:  make(map[string]string),
-					}
-					if tc.Function.Name != nil {
-						(*currentToolUse).Name = *tc.Function.Name
-					}
-					return &StreamChunk{
-						Type:    ChunkTypeToolUseStart,
-						ToolUse: *currentToolUse,
-					}
-				}
-
-				// 工具调用参数增量
-				if tc.Function.Arguments != nil && *tc.Function.Arguments != "" && *currentToolUse != nil {
-					return &StreamChunk{
-						Type: ChunkTypeToolUseDelta,
-					}
-				}
-			}
-		}
-	}
-
-	// 流结束
-	if choice.FinishReason != "" {
-		return &StreamChunk{
-			Type: ChunkTypeUsage,
-			Usage: &Usage{},
-			Done:  true,
-		}
-	}
-
-	return nil
-}
-
-func (p *OpenAIProxy) doRequest(ctx context.Context, body map[string]interface{}, stream bool) (*http.Response, error) {
-	jsonBody, err := json.Marshal(body)
+func (p *OpenAIProxy) sendOpenAINonStream(ctx context.Context, reqBody string) *ProxyResponse {
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	baseURL := p.provider.BaseURL
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
-	}
-	if !strings.HasSuffix(baseURL, "/chat/completions") {
-		if !strings.HasSuffix(baseURL, "/") {
-			baseURL += "/"
-		}
-		baseURL += "chat/completions"
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(string(jsonBody)))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return &ProxyResponse{Error: fmt.Errorf("create request: %w", err)}
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
 
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return &ProxyResponse{Error: fmt.Errorf("send request: %w", err)}
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := readResponseBody(resp)
+	if err != nil {
+		return &ProxyResponse{Error: err}
 	}
 
-	return p.client.Do(req)
+	if resp.StatusCode != http.StatusOK {
+		return &ProxyResponse{Error: fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))}
+	}
+
+	return &ProxyResponse{Body: string(respBytes), IsStream: false}
+}
+
+func (p *OpenAIProxy) sendOpenAIStream(ctx context.Context, reqBody string) *ProxyResponse {
+	ch := make(chan string, 16)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(ch)
+		defer close(errCh)
+
+		baseURL := p.buildURL()
+		req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
+		if err != nil {
+			errCh <- fmt.Errorf("create request: %w", err)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+		req.Header.Set("Accept", "text/event-stream")
+
+		resp, err := p.client.Do(req)
+		if err != nil {
+			errCh <- fmt.Errorf("send request: %w", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			errCh <- fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(body))
+			return
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				ch <- "\n"
+			} else {
+				ch <- line + "\n"
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			errCh <- fmt.Errorf("scan stream: %w", err)
+		}
+	}()
+
+	return &ProxyResponse{StreamCh: ch, ErrCh: errCh, IsStream: true}
+}
+
+func (p *OpenAIProxy) buildURL() string {
+	baseURL := p.provider.BaseURL
+	if !strings.HasSuffix(baseURL, "/chat/completions") {
+		if !strings.HasSuffix(baseURL, "/v1") && !strings.HasSuffix(baseURL, "/v1/") {
+			if !strings.HasSuffix(baseURL, "/") {
+				baseURL += "/"
+			}
+			baseURL += "v1"
+		}
+		baseURL += "/chat/completions"
+	}
+	return baseURL
 }
 
 // ============================================================
-// 响应类型定义
+// 格式转换
 // ============================================================
 
-type openAIResponse struct {
-	ID      string            `json:"id"`
-	Object  string            `json:"object"`
-	Created int64             `json:"created"`
-	Model   string            `json:"model"`
-	Choices []openAIChoice    `json:"choices"`
-	Usage   openAIUsage       `json:"usage"`
-	Error   openAIError       `json:"error"`
-}
+func (p *OpenAIProxy) convertAnthropicToOpenAI(anthropicReq string) (string, error) {
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(anthropicReq), &req); err != nil {
+		return "", err
+	}
 
-type openAIChoice struct {
-	Index        int               `json:"index"`
-	Message      openAIMessage     `json:"message"`
-	FinishReason string            `json:"finish_reason"`
-	Delta        openAIDelta       `json:"delta"`
-}
+	openaiReq := map[string]interface{}{
+		"model":      req["model"],
+		"max_tokens": req["max_tokens"],
+		"messages":   convertAnthropicMessagesToOpenAI(req["messages"], req["system"]),
+	}
 
-type openAIMessage struct {
-	Role      string              `json:"role"`
-	Content   *string             `json:"content"`
-	ToolCalls []openAIToolCall    `json:"tool_calls,omitempty"`
-}
+	if v, ok := req["temperature"].(float64); ok && v > 0 {
+		openaiReq["temperature"] = v
+	}
+	if v, ok := req["top_p"].(float64); ok && v > 0 {
+		openaiReq["top_p"] = v
+	}
+	if v, ok := req["stream"].(bool); ok {
+		openaiReq["stream"] = v
+	}
 
-type openAIToolCall struct {
-	Index    int                `json:"index"`
-	ID       string             `json:"id"`
-	Type     string             `json:"type"`
-	Function openAIFunction     `json:"function"`
-}
+	if tools, ok := req["tools"].([]interface{}); ok {
+		openaiReq["tools"] = convertAnthropicToolsToOpenAI(tools)
+		openaiReq["tool_choice"] = "auto"
+	}
 
-type openAIFunction struct {
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
-}
-
-type openAIDelta struct {
-	Role      string               `json:"role,omitempty"`
-	Content   *string              `json:"content,omitempty"`
-	ToolCalls []openAIStreamToolCall `json:"tool_calls,omitempty"`
-}
-
-type openAIStreamToolCall struct {
-	Index    *int              `json:"index,omitempty"`
-	ID       *string           `json:"id,omitempty"`
-	Function *openAIStreamFunction `json:"function,omitempty"`
-}
-
-type openAIStreamFunction struct {
-	Name      *string `json:"name,omitempty"`
-	Arguments *string `json:"arguments,omitempty"`
-}
-
-type openAIUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-type openAIError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Code    string `json:"code"`
-}
-
-type openAIStreamChunk struct {
-	ID      string          `json:"id"`
-	Object  string          `json:"object"`
-	Created int64           `json:"created"`
-	Model   string          `json:"model"`
-	Choices []openAIChoice  `json:"choices"`
+	data, _ := json.Marshal(openaiReq)
+	return string(data), nil
 }
