@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"io"
+	"net/http"
 	"sync"
 	"time"
 
@@ -37,11 +38,11 @@ type ProxyResponse struct {
 type CcProxy interface {
 	// SendOpenAIFormat 发送 OpenAI 格式请求
 	// 返回：根据 stream 参数返回非流式或流式响应
-	SendOpenAIFormat(ctx context.Context, reqBody string) *ProxyResponse
+	SendOpenAIFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse
 
 	// SendAnthropicFormat 发送 Anthropic 格式请求
 	// 返回：根据 stream 参数返回非流式或流式响应
-	SendAnthropicFormat(ctx context.Context, reqBody string) *ProxyResponse
+	SendAnthropicFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse
 
 	// Close 释放代理资源
 	Close() error

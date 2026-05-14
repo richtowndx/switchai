@@ -8,11 +8,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"switchai/history"
 	"switchai/logger"
 	"switchai/stats"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // baseProxyHandlerWithCcProxy 使用 CcProxy 接口的代理处理逻辑
@@ -49,21 +50,20 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
 		return
 	}
-	originalBody := string(bodyBytes)
 
-	// 4. 根据请求格式选择调用方式（传递原始请求体）
+	// 4. 根据请求格式选择调用方式（传递原始请求头和请求体）
 	ctx := context.Background()
 	if cfg.isIncomingOpenAIFormat {
-		entry.handleOpenAIRequest(ctx, c, originalBody, requestID, startTime, keyID, clientIP)
+		entry.handleOpenAIRequest(ctx, c, c.Request.Header, bodyBytes, requestID, startTime, keyID, clientIP)
 	} else {
-		entry.handleAnthropicRequest(ctx, c, originalBody, requestID, startTime, keyID, clientIP)
+		entry.handleAnthropicRequest(ctx, c, c.Request.Header, bodyBytes, requestID, startTime, keyID, clientIP)
 	}
 }
 
 // handleOpenAIRequest 处理 OpenAI 格式请求
-func (e *ConnProxyEntry) handleOpenAIRequest(ctx context.Context, c *gin.Context, reqBody string, requestID string, startTime time.Time, keyID, clientIP string) {
+func (e *ConnProxyEntry) handleOpenAIRequest(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte, requestID string, startTime time.Time, keyID, clientIP string) {
 	// 调用 Proxy（内部处理模型映射、格式转换、流式判断）
-	resp := e.Proxy.SendOpenAIFormat(ctx, reqBody)
+	resp := e.Proxy.SendOpenAIFormat(ctx, reqHdr, reqBody)
 
 	if resp.Error != nil {
 		logger.Error("❌ Proxy request failed: %v", resp.Error)
@@ -80,9 +80,9 @@ func (e *ConnProxyEntry) handleOpenAIRequest(ctx context.Context, c *gin.Context
 }
 
 // handleAnthropicRequest 处理 Anthropic 格式请求
-func (e *ConnProxyEntry) handleAnthropicRequest(ctx context.Context, c *gin.Context, reqBody string, requestID string, startTime time.Time, keyID, clientIP string) {
+func (e *ConnProxyEntry) handleAnthropicRequest(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte, requestID string, startTime time.Time, keyID, clientIP string) {
 	// 调用 Proxy（内部处理模型映射、格式转换、流式判断）
-	resp := e.Proxy.SendAnthropicFormat(ctx, reqBody)
+	resp := e.Proxy.SendAnthropicFormat(ctx, reqHdr, reqBody)
 
 	if resp.Error != nil {
 		logger.Error("❌ Proxy request failed: %v", resp.Error)
@@ -121,22 +121,22 @@ func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte
 		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
 
 	history.AddRecord(history.RequestRecord{
-		ID:          requestID,
-		Timestamp:   startTime,
-		Method:      c.Request.Method,
-		Path:        c.Request.URL.Path,
-		ClientIP:    clientIP,
-		KeyID:       keyID,
-		Provider:    e.Provider.Name,
-		Model:       model,
-		StatusCode:  200,
-		Duration:    duration,
-		RequestBody: "",
+		ID:              requestID,
+		Timestamp:       startTime,
+		Method:          c.Request.Method,
+		Path:            c.Request.URL.Path,
+		ClientIP:        clientIP,
+		KeyID:           keyID,
+		Provider:        e.Provider.Name,
+		Model:           model,
+		StatusCode:      200,
+		Duration:        duration,
+		RequestBody:     "",
 		ResponseHeaders: make(http.Header),
-		InputTokens: inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens: inputTokens + outputTokens,
-		Cost:        cost,
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
+		TotalTokens:     inputTokens + outputTokens,
+		Cost:            cost,
 	})
 
 	logger.Info("✅ 非流式响应完成: Model=%s, Tokens=%d+%d, Cost=$%.4f, Duration=%dms",
@@ -210,22 +210,22 @@ done:
 		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
 
 	history.AddRecord(history.RequestRecord{
-		ID:          requestID,
-		Timestamp:   startTime,
-		Method:      c.Request.Method,
-		Path:        c.Request.URL.Path,
-		ClientIP:    clientIP,
-		KeyID:       keyID,
-		Provider:    e.Provider.Name,
-		Model:       model,
-		StatusCode:  200,
-		Duration:    duration,
-		RequestBody: "",
+		ID:              requestID,
+		Timestamp:       startTime,
+		Method:          c.Request.Method,
+		Path:            c.Request.URL.Path,
+		ClientIP:        clientIP,
+		KeyID:           keyID,
+		Provider:        e.Provider.Name,
+		Model:           model,
+		StatusCode:      200,
+		Duration:        duration,
+		RequestBody:     "",
 		ResponseHeaders: make(http.Header),
-		InputTokens: inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens: inputTokens + outputTokens,
-		Cost:        cost,
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
+		TotalTokens:     inputTokens + outputTokens,
+		Cost:            cost,
 	})
 
 	logger.Info("✅ 流式响应完成: Model=%s, Tokens=%d+%d, Cost=$%.4f, Duration=%dms, TTFB=%dms",

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -11,9 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/andybalholm/brotli"
 	"switchai/config"
 	"switchai/logger"
+
+	"github.com/andybalholm/brotli"
 )
 
 func init() {
@@ -47,12 +49,12 @@ func NewAnthropicProxy(provider *config.Provider) (CcProxy, error) {
 
 // SendAnthropicFormat 发送 Anthropic 格式请求
 // 优化：单次 JSON 解析完成模型映射 + stream 检查
-func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
 	// 1. 一次性解析并处理：模型映射 + stream 检查
 	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
 
 	if isStream {
-		resp := p.sendAnthropicStream(ctx, modifiedBody)
+		resp := p.sendAnthropicStream(ctx, reqHdr, modifiedBody)
 		resp.ModelName = modelName
 		return resp
 	}
@@ -63,12 +65,12 @@ func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqBody string
 
 // SendOpenAIFormat 发送 OpenAI 格式请求
 // 优化：转换 + 模型映射 + stream 检查一次性完成
-func (p *AnthropicProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *AnthropicProxy) SendOpenAIFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
 	// 1. 转换并处理：OpenAI → Anthropic + 模型映射 + stream 检查
 	modifiedBody, modelName, isStream := p.convertAndProcessOpenAIRequest(reqBody)
 
 	if isStream {
-		resp := p.sendAnthropicStream(ctx, modifiedBody)
+		resp := p.sendAnthropicStream(ctx, reqHdr, modifiedBody)
 		resp.ModelName = modelName
 		return resp
 	}
@@ -94,9 +96,9 @@ func (p *AnthropicProxy) Provider() *config.Provider {
 
 // parseAndProcessRequest 一次性解析并处理：模型映射 + stream 检查
 // 优化：从原来的 2 次 JSON 解析 + 1 次序列化 → 1 次解析 + 1 次序列化
-func (p *AnthropicProxy) parseAndProcessRequest(reqBody string) (string, string, bool) {
+func (p *AnthropicProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
-	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
+	if err := json.Unmarshal(reqBody, &req); err != nil {
 		return reqBody, "", false
 	}
 
@@ -121,15 +123,15 @@ func (p *AnthropicProxy) parseAndProcessRequest(reqBody string) (string, string,
 
 	// 一次性序列化
 	result, _ := json.Marshal(req)
-	return string(result), modelName, isStream
+	return result, modelName, isStream
 }
 
 // convertAndProcessOpenAIRequest 转换 OpenAI → Anthropic + 模型映射 + stream 检查
 // 优化：从原来的 4 次 JSON 处理 → 2 次
-func (p *AnthropicProxy) convertAndProcessOpenAIRequest(openaiReq string) (string, string, bool) {
+func (p *AnthropicProxy) convertAndProcessOpenAIRequest(openaiReq []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
-	if err := json.Unmarshal([]byte(openaiReq), &req); err != nil {
-		return "", "", false
+	if err := json.Unmarshal(openaiReq, &req); err != nil {
+		return nil, "", false
 	}
 
 	modelName := ""
@@ -177,12 +179,12 @@ func (p *AnthropicProxy) convertAndProcessOpenAIRequest(openaiReq string) (strin
 
 	// 一次性序列化
 	result, _ := json.Marshal(anthropicReq)
-	return string(result), modelName, isStream
+	return result, modelName, isStream
 }
 
-func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody []byte) *ProxyResponse {
 	baseURL := p.buildURL()
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
 		return &ProxyResponse{Error: fmt.Errorf("create request: %w", err)}
 	}
@@ -209,7 +211,7 @@ func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody str
 	return &ProxyResponse{Body: respBytes, IsStream: false}
 }
 
-func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
 	ch := make(chan string, 16)
 	errCh := make(chan error, 1)
 
@@ -218,16 +220,23 @@ func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqBody string
 		defer close(errCh)
 
 		baseURL := p.buildURL()
-		req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
+		req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 		if err != nil {
 			errCh <- fmt.Errorf("create request: %w", err)
 			return
 		}
 
+		// 设置必要的请求头
+		for k, v := range reqHdr {
+			for _, val := range v {
+				if strings.ToLower(k) == "authorization" || strings.ToLower(k) == "content-type" {
+					continue
+				}
+				req.Header.Add(k, val)
+			}
+		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-api-key", p.provider.APIKey)
-		req.Header.Set("anthropic-version", "2023-06-01")
-		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
 
 		resp, err := p.client.Do(req)
 		if err != nil {
@@ -246,7 +255,7 @@ func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqBody string
 		// 使用 buffer pool 减少 memory allocation
 		buf := scannerBufferPool.Get().([]byte)
 		defer func() { scannerBufferPool.Put(buf) }()
-		
+
 		scanner.Buffer(buf, 1024*1024)
 
 		for scanner.Scan() {

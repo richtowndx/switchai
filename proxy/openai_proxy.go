@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"bufio"
 	"context"
 	"encoding/json"
@@ -45,7 +46,7 @@ func NewOpenAIProxy(provider *config.Provider) (CcProxy, error) {
 
 // SendOpenAIFormat 发送 OpenAI 格式请求
 // 优化：单次 JSON 解析完成模型映射 + stream 检查
-func (p *OpenAIProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *OpenAIProxy) SendOpenAIFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
 	// 1. 一次性解析并处理：模型映射 + stream 检查
 	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
 
@@ -61,7 +62,7 @@ func (p *OpenAIProxy) SendOpenAIFormat(ctx context.Context, reqBody string) *Pro
 
 // SendAnthropicFormat 发送 Anthropic 格式请求
 // 优化：转换 + 模型映射 + stream 检查一次性完成
-func (p *OpenAIProxy) SendAnthropicFormat(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *OpenAIProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
 	// 1. 转换并处理：Anthropic → OpenAI + 模型映射 + stream 检查
 	modifiedBody, modelName, isStream := p.convertAndProcessAnthropicRequest(reqBody)
 
@@ -91,9 +92,9 @@ func (p *OpenAIProxy) Provider() *config.Provider {
 // ============================================================
 
 // parseAndProcessRequest 一次性解析并处理：模型映射 + stream 检查
-func (p *OpenAIProxy) parseAndProcessRequest(reqBody string) (string, string, bool) {
+func (p *OpenAIProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
-	if err := json.Unmarshal([]byte(reqBody), &req); err != nil {
+	if err := json.Unmarshal(reqBody, &req); err != nil {
 		return reqBody, "", false
 	}
 
@@ -118,14 +119,14 @@ func (p *OpenAIProxy) parseAndProcessRequest(reqBody string) (string, string, bo
 
 	// 一次性序列化
 	result, _ := json.Marshal(req)
-	return string(result), modelName, isStream
+	return result, modelName, isStream
 }
 
 // convertAndProcessAnthropicRequest 转换 Anthropic → OpenAI + 模型映射 + stream 检查
-func (p *OpenAIProxy) convertAndProcessAnthropicRequest(anthropicReq string) (string, string, bool) {
+func (p *OpenAIProxy) convertAndProcessAnthropicRequest(anthropicReq []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
-	if err := json.Unmarshal([]byte(anthropicReq), &req); err != nil {
-		return "", "", false
+	if err := json.Unmarshal(anthropicReq, &req); err != nil {
+		return nil, "", false
 	}
 
 	modelName := ""
@@ -173,12 +174,12 @@ func (p *OpenAIProxy) convertAndProcessAnthropicRequest(anthropicReq string) (st
 
 	// 一次性序列化
 	result, _ := json.Marshal(openaiReq)
-	return string(result), modelName, isStream
+	return result, modelName, isStream
 }
 
-func (p *OpenAIProxy) sendOpenAINonStream(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *OpenAIProxy) sendOpenAINonStream(ctx context.Context, reqBody []byte) *ProxyResponse {
 	baseURL := p.buildURL()
-	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
 		return &ProxyResponse{Error: fmt.Errorf("create request: %w", err)}
 	}
@@ -204,7 +205,7 @@ func (p *OpenAIProxy) sendOpenAINonStream(ctx context.Context, reqBody string) *
 	return &ProxyResponse{Body: respBytes, IsStream: false}
 }
 
-func (p *OpenAIProxy) sendOpenAIStream(ctx context.Context, reqBody string) *ProxyResponse {
+func (p *OpenAIProxy) sendOpenAIStream(ctx context.Context, reqBody []byte) *ProxyResponse {
 	ch := make(chan string, 16)
 	errCh := make(chan error, 1)
 
@@ -213,7 +214,7 @@ func (p *OpenAIProxy) sendOpenAIStream(ctx context.Context, reqBody string) *Pro
 		defer close(errCh)
 
 		baseURL := p.buildURL()
-		req, err := http.NewRequestWithContext(ctx, "POST", baseURL, strings.NewReader(reqBody))
+		req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 		if err != nil {
 			errCh <- fmt.Errorf("create request: %w", err)
 			return
