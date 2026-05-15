@@ -169,8 +169,15 @@ func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int)
 	var data string
 	var isSSE bool
 
+	// 兼容两种 SSE 格式: "data: " (带空格) 和 "data:" (不带空格)
 	if strings.HasPrefix(line, "data: ") {
 		data = strings.TrimPrefix(line, "data: ")
+		isSSE = true
+		if data == "[DONE]" {
+			return inputTokens, outputTokens
+		}
+	} else if strings.HasPrefix(line, "data:") {
+		data = strings.TrimPrefix(line, "data:")
 		isSSE = true
 		if data == "[DONE]" {
 			return inputTokens, outputTokens
@@ -197,13 +204,16 @@ func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int)
 			switch eventType {
 			case "message_start":
 				// 只捕获 input_tokens（最终值），此时 output_tokens=0 是占位，不应记录
-				if usage, ok := event["usage"].(map[string]interface{}); ok {
-					if it, ok := usage["input_tokens"].(float64); ok {
-						inputTokens = int(it)
-					}
-					// cache tokens 也从这里获取
-					if cacheRead, ok := usage["cache_read_input_tokens"].(float64); ok && cacheRead > 0 {
-						// 可选：记录 cache_read_tokens
+				// Anthropic 格式: event.message.usage.input_tokens
+				if message, ok := event["message"].(map[string]interface{}); ok {
+					if usage, ok := message["usage"].(map[string]interface{}); ok {
+						if it, ok := usage["input_tokens"].(float64); ok {
+							inputTokens = int(it)
+						}
+						// cache tokens 也从这里获取
+						if cacheRead, ok := usage["cache_read_input_tokens"].(float64); ok && cacheRead > 0 {
+							// 可选：记录 cache_read_tokens
+						}
 					}
 				}
 				return inputTokens, outputTokens
