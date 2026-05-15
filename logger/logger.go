@@ -14,14 +14,12 @@ import (
 
 var (
 	InfoLogger  *log.Logger
+	WarnLogger  *log.Logger
 	ErrorLogger *log.Logger
 	currentDate string
 	logMutex    sync.Mutex
 	infoFile    *os.File
 	errorFile   *os.File
-	hasInfoLog  bool // 标记是否有info日志写入
-	hasErrorLog bool // 标记是否有error日志写入
-	writerMutex sync.Mutex
 )
 
 // 日志文件保留天数
@@ -94,10 +92,12 @@ func rotateLogFiles() error {
 
 	// 创建多输出：同时输出到文件和控制台
 	infoWriter := io.MultiWriter(os.Stdout, infoFile)
+	warnWriter := io.MultiWriter(os.Stderr, infoFile)
 	errorWriter := io.MultiWriter(os.Stderr, errorFile)
 
 	// 初始化日志记录器
 	InfoLogger = log.New(infoWriter, "[INFO] ", log.LstdFlags|log.Lmicroseconds|log.Lshortfile)
+	WarnLogger = log.New(warnWriter, "[WARN] ", log.LstdFlags|log.Lmicroseconds|log.Lshortfile)
 	ErrorLogger = log.New(errorWriter, "[ERROR] ", log.LstdFlags|log.Lmicroseconds|log.Lshortfile)
 
 	// 设置默认日志输出
@@ -184,19 +184,20 @@ func cleanupLogs() {
 // Info 记录信息日志
 func Info(format string, v ...interface{}) {
 	if InfoLogger != nil {
-		writerMutex.Lock()
-		hasInfoLog = true
-		writerMutex.Unlock()
 		InfoLogger.Printf(format, v...)
+	}
+}
+
+// Warn 记录警告日志（输出到 stderr + info 日志文件）
+func Warn(format string, v ...interface{}) {
+	if WarnLogger != nil {
+		WarnLogger.Printf(format, v...)
 	}
 }
 
 // Error 记录错误日志
 func Error(format string, v ...interface{}) {
 	if ErrorLogger != nil {
-		writerMutex.Lock()
-		hasErrorLog = true
-		writerMutex.Unlock()
 		ErrorLogger.Printf(format, v...)
 	}
 }

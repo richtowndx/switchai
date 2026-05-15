@@ -427,7 +427,7 @@ func (c *Config) GetClientHashedProvider(hash uint64, attempt int) *Provider {
 		return nil
 	}
 
-	idx := hash % uint64(len(c.Providers))
+	idx := (hash + uint64(attempt)) % uint64(len(c.Providers))
 	return &c.Providers[idx]
 }
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"switchai/config"
+	"switchai/logger"
 
 	"github.com/google/uuid"
 )
@@ -164,7 +165,7 @@ func (t *ConnectionTracker) OnAccept(conn net.Conn, protocol string, isTLS bool)
 	t.connections.Store(connID, info)
 	t.activeConns.Add(1)
 
-	fmt.Printf("[ACCEPT] %s from %s (proto: %s, tls: %v, provider: %s, hash: %d)\n",
+	logger.Info("[ACCEPT] %s from %s (proto: %s, tls: %v, provider: %s, hash: %d)",
 		connID, info.RemoteAddr, protocol, isTLS, getProviderName(provider), clientHash)
 
 	return info
@@ -184,14 +185,13 @@ func (t *ConnectionTracker) OnClose(info *ConnectionInfo, err error) {
 		status = "error: " + err.Error()
 	}
 
-	fmt.Printf("[CLOSE] %s from %s (duration: %v, idle: %v, read: %s, write: %s, provider: %s, status: %s)\n",
+	logger.Info("[CLOSE] %s from %s (duration: %v, idle: %v, read: %s, write: %s, provider: %s, status: %s)",
 		info.ID, info.RemoteAddr, duration.Truncate(time.Millisecond),
 		idleTime.Truncate(time.Millisecond),
 		formatBytes(info.BytesRead.Load()),
 		formatBytes(info.BytesWrite.Load()),
 		getProviderName(info.Provider()),
-		status,
-	)
+		status)
 
 	t.connections.Delete(info.ID)
 	t.activeConns.Add(-1)
@@ -209,7 +209,7 @@ func (t *ConnectionTracker) GetConnProvider(connID string, attempt int) *config.
 		if newProvider != nil {
 			connInfo.SetProvider(newProvider)
 			connInfo.SetProviderIdx(attempt)
-			fmt.Printf("[SWITCH] %s: provider -> %s (attempt %d)\n",
+			logger.Info("[SWITCH] %s: provider -> %s (attempt %d)",
 				connID, newProvider.Name, attempt)
 		}
 		return newProvider
@@ -248,7 +248,7 @@ func (t *ConnectionTracker) PrintStats() {
 		return true
 	})
 
-	fmt.Printf("[STATS] Active: %d, Total: %d, Read: %s, Write: %s\n%s",
+	logger.Info("[STATS] Active: %d, Total: %d, Read: %s, Write: %s\n%s",
 		activeCount,
 		t.totalConns.Load(),
 		formatBytes(totalBytesRead),
@@ -262,7 +262,7 @@ func (t *ConnectionTracker) CleanupStaleConnections(maxIdle time.Duration) {
 		info := value.(*ConnectionInfo)
 		if lastActive := info.LastActive.Load(); lastActive != nil {
 			if now.Sub(*lastActive) > maxIdle {
-				fmt.Printf("[CLEANUP] Removing stale connection: %s (idle: %v)\n",
+				logger.Info("[CLEANUP] Removing stale connection: %s (idle: %v)",
 					info.ID, now.Sub(*lastActive))
 				t.connections.Delete(key)
 				t.activeConns.Add(-1)

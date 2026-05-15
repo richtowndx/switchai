@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -67,13 +66,9 @@ func main() {
 		cfg := config.GetConfig()
 		if err := cfg.ResetTOTP(); err != nil {
 			logger.Error("Failed to reset 2FA: %v", err)
-			fmt.Fprintf(os.Stderr, "Failed to reset 2FA: %v\n", err)
 			os.Exit(1)
 		}
-		logger.Info("2FA has been reset successfully")
-		fmt.Println("✅ 2FA 数据已重置，访问页面将跳转到首次绑定")
-		// Also clear all sessions to force re-login
-		cfg.ClearAllSessionTokens()
+		logger.Info("2FA has been reset successfully. Please visit the page to re-bind.")
 		os.Exit(0)
 		return
 	}
@@ -81,7 +76,7 @@ func main() {
 	// Handle service installation/uninstallation
 	if *install {
 		if err := service.Install(*port); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to install service: %v\n", err)
+			logger.Error("Failed to install service: %v", err)
 			os.Exit(1)
 		}
 		return
@@ -89,7 +84,7 @@ func main() {
 
 	if *uninstall {
 		if err := service.Uninstall(); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to uninstall service: %v\n", err)
+			logger.Error("Failed to uninstall service: %v", err)
 			os.Exit(1)
 		}
 		return
@@ -177,13 +172,13 @@ func startServer(port string) {
 	// 启动服务器
 	go func() {
 		logger.Info("Starting SwitchAI HTTP service on %s", addr)
-		fmt.Printf("\n🚀 SwitchAI is running on http://localhost%s\n\n", port)
-		fmt.Printf("📊 Connection tracking: ENABLED\n\n")
+		logger.Info("🚀 SwitchAI is running on http://localhost%s", port)
+		logger.Info("📊 Connection tracking: ENABLED")
 
 		// 使用 TrackedListener 启动 HTTP
 		if err := srv.Serve(trackedLn); err != nil && err != http.ErrServerClosed {
 			logger.Error("Failed to start server: %v", err)
-			log.Fatalf("Failed to start server: %v", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -193,7 +188,6 @@ func startServer(port string) {
 	<-quit
 
 	logger.Info("Shutting down server...")
-	fmt.Println("\n🛑 正在关闭服务器...")
 
 	// 打印最终连接统计
 	tracker.PrintStats()
@@ -224,6 +218,5 @@ func startServer(port string) {
 		logger.Error("Server forced to shutdown: %v", err)
 	}
 
-	logger.Info("Server exited")
-	fmt.Println("✅ 服务器已安全退出")
+	logger.Info("✅ Server exited safely")
 }

@@ -253,7 +253,7 @@ func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody []b
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", p.provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := p.client.Do(req)
@@ -401,8 +401,7 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", p.provider.APIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -440,26 +439,26 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 
 	// 记录 history
 	history.AddRecord(history.RequestRecord{
-		ID:           requestID,
-		Timestamp:    startTime,
-		Method:       method,
-		Path:         path,
-		ClientIP:     clientIP,
-		KeyID:        keyID,
-		Provider:     p.provider.Name,
-		Model:        modelName,
-		StatusCode:   resp.StatusCode,
-		Duration:     duration,
-		RequestBody:  requestBody,
-		ResponseBody: string(respBytes),
-		RequestHeaders: c.Request.Header,
+		ID:              requestID,
+		Timestamp:       startTime,
+		Method:          method,
+		Path:            path,
+		ClientIP:        clientIP,
+		KeyID:           keyID,
+		Provider:        p.provider.Name,
+		Model:           modelName,
+		StatusCode:      resp.StatusCode,
+		Duration:        duration,
+		RequestBody:     requestBody,
+		ResponseBody:    string(respBytes),
+		RequestHeaders:  c.Request.Header,
 		ResponseHeaders: resp.Header,
-		RequestSize:  int64(len(requestBody)),
-		ResponseSize: int64(len(respBytes)),
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  inputTokens + outputTokens,
-		Cost:         cost,
+		RequestSize:     int64(len(requestBody)),
+		ResponseSize:    int64(len(respBytes)),
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
+		TotalTokens:     inputTokens + outputTokens,
+		Cost:            cost,
 	})
 
 	logger.Info("✅ Anthropic non-stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms", modelName, inputTokens, outputTokens, duration)
@@ -585,26 +584,26 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	}
 
 	history.AddRecord(history.RequestRecord{
-		ID:           requestID,
-		Timestamp:    startTime,
-		Method:       method,
-		Path:         path,
-		ClientIP:     clientIP,
-		KeyID:        keyID,
-		Provider:     p.provider.Name,
-		Model:        modelName,
-		StatusCode:   resp.StatusCode,
-		Duration:     duration,
-		RequestBody:  requestBody,
-		ResponseBody: responseBodyStr,
-		RequestHeaders: c.Request.Header,
+		ID:              requestID,
+		Timestamp:       startTime,
+		Method:          method,
+		Path:            path,
+		ClientIP:        clientIP,
+		KeyID:           keyID,
+		Provider:        p.provider.Name,
+		Model:           modelName,
+		StatusCode:      resp.StatusCode,
+		Duration:        duration,
+		RequestBody:     requestBody,
+		ResponseBody:    responseBodyStr,
+		RequestHeaders:  c.Request.Header,
 		ResponseHeaders: resp.Header,
-		RequestSize:  int64(len(requestBody)),
-		ResponseSize: int64(responseBody.Len()),
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  inputTokens + outputTokens,
-		Cost:         cost,
+		RequestSize:     int64(len(requestBody)),
+		ResponseSize:    int64(responseBody.Len()),
+		InputTokens:     inputTokens,
+		OutputTokens:    outputTokens,
+		TotalTokens:     inputTokens + outputTokens,
+		Cost:            cost,
 	})
 
 	logger.Info("✅ Anthropic stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms, TTFB=%dms",

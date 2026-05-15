@@ -13,6 +13,41 @@ import (
 	"github.com/google/uuid"
 )
 
+// shouldSwitchProvider 判断错误是否为需要切换 provider 的错误
+// 包括：401/403 认证错误、400 参数/模型错误（避免重复失败）
+func shouldSwitchProvider(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "status 401") ||
+		strings.Contains(msg, "status 403") ||
+		strings.Contains(msg, "status 400")
+}
+
+// getStatusCodeFromError 从错误信息中提取 HTTP 状态码
+func getStatusCodeFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	msg := err.Error()
+	// 查找 "status N" 模式
+	for i := 0; i < len(msg)-7; i++ {
+		if msg[i:i+6] == "status " {
+			j := i + 6
+			code := 0
+			for j < len(msg) && msg[j] >= '0' && msg[j] <= '9' {
+				code = code*10 + int(msg[j]-'0')
+				j++
+			}
+			if code > 0 {
+				return code
+			}
+		}
+	}
+	return 0
+}
+
 // baseProxyHandlerWithCcProxy 使用 CcProxy 接口的代理处理逻辑
 // 优化：Handler 只负责认证和传递原始请求，所有转换由 Proxy 内部处理
 func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
@@ -58,11 +93,45 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 	if cfg.isIncomingOpenAIFormat {
 		if err := entry.Proxy.HandleOpenAIFormat(ctx, c, c.Request.Header, bodyBytes); err != nil {
 			logger.Error("❌ HandleOpenAIFormat failed: %v", err)
+			if shouldSwitchProvider(err) {
+				logger.Error("[ConnProxyManager] 切换 provider (错误 %d) 并重试: %s -> %s", getStatusCodeFromError(err), c.Request.RemoteAddr, entry.Provider.Name)
+				newEntry, switchErr := mgr.SwitchProvider(c.Request.RemoteAddr, entry.providerIdx+1)
+				if switchErr == nil {
+					logger.Info("📡 切换到新 CcProxy: %s", newEntry.Provider.Name)
+					if retryErr := newEntry.Proxy.HandleOpenAIFormat(ctx, c, c.Request.Header, bodyBytes); retryErr == nil {
+						return
+					} else {
+						logger.Error("❌ 重试 HandleOpenAIFormat 仍失败 (provider=%s): %v", newEntry.Provider.Name, retryErr)
+						if shouldSwitchProvider(retryErr) {
+							mgr.Remove(c.Request.RemoteAddr)
+						}
+					}
+				} else {
+					mgr.Remove(c.Request.RemoteAddr)
+				}
+			}
 			c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
 		}
 	} else {
 		if err := entry.Proxy.HandleAnthropicFormat(ctx, c, c.Request.Header, bodyBytes); err != nil {
 			logger.Error("❌ HandleAnthropicFormat failed: %v", err)
+			if shouldSwitchProvider(err) {
+				logger.Error("[ConnProxyManager] 切换 provider (错误 %d) 并重试: %s -> %s", getStatusCodeFromError(err), c.Request.RemoteAddr, entry.Provider.Name)
+				newEntry, switchErr := mgr.SwitchProvider(c.Request.RemoteAddr, entry.providerIdx+1)
+				if switchErr == nil {
+					logger.Info("📡 切换到新 CcProxy: %s", newEntry.Provider.Name)
+					if retryErr := newEntry.Proxy.HandleAnthropicFormat(ctx, c, c.Request.Header, bodyBytes); retryErr == nil {
+						return
+					} else {
+						logger.Error("❌ 重试 HandleAnthropicFormat 仍失败 (provider=%s): %v", newEntry.Provider.Name, retryErr)
+						if shouldSwitchProvider(retryErr) {
+							mgr.Remove(c.Request.RemoteAddr)
+						}
+					}
+				} else {
+					mgr.Remove(c.Request.RemoteAddr)
+				}
+			}
 			c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
 		}
 	}
