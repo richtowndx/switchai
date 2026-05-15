@@ -16,7 +16,6 @@ import (
 	"switchai/proxy"
 	"switchai/service"
 	"switchai/stats"
-	"switchai/update"
 	"switchai/web"
 	"syscall"
 	"time"
@@ -32,10 +31,6 @@ var (
 	versionPatch = "0"
 	gitCommit    = ""
 )
-
-func init() {
-	update.InitWithCommitStr(versionMajor, versionMinor, versionPatch, gitCommit)
-}
 
 func main() {
 	// Parse command line flags

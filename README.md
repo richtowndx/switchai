@@ -404,7 +404,6 @@ switchai/
 │   └── response_converter.go # 响应格式转换
 ├── stats/                  # Token 统计
 ├── service/                # 服务安装管理
-├── update/                 # 自动更新
 └── web/                    # Web 服务和 API
     ├── web.go              # Web API + 静态资源 embed
     ├── copilot.go          # Copilot OAuth Device Code Flow API
