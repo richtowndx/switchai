@@ -237,8 +237,14 @@ func (t *ConnectionTracker) PrintStats() {
 		activeCount++
 		totalBytesRead += info.BytesRead.Load()
 		totalBytesWrite += info.BytesWrite.Load()
+		providerName := "none"
+		isOpenAI := false
+		if p := info.Provider(); p != nil {
+			providerName = p.Name
+			isOpenAI = p.IsOpenAIFormat
+		}
 		conn_str += fmt.Sprintf("  - %s: %s -> provider: %s (isOpenAI: %v)\n",
-			info.ID, info.RemoteAddr, info.Provider().Name, info.Provider().IsOpenAIFormat)
+			info.ID, info.RemoteAddr, providerName, isOpenAI)
 		return true
 	})
 

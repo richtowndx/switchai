@@ -12,7 +12,11 @@ import (
 	"time"
 
 	"switchai/config"
+	"switchai/history"
 	"switchai/logger"
+	"switchai/stats"
+
+	"github.com/gin-gonic/gin"
 )
 
 func init() {
@@ -273,4 +277,252 @@ func (p *OpenAIProxy) buildURL() string {
 		baseURL += "/chat/completions"
 	}
 	return baseURL
+}
+
+// HandleOpenAIFormat 处理 OpenAI 格式请求（包括发送和响应转发）
+func (p *OpenAIProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+	startTime := time.Now()
+	var firstTokenTime time.Time
+
+	// 生成请求ID
+	requestID := c.GetHeader("X-Request-ID")
+	if requestID == "" {
+		requestID = c.GetString("request_id")
+	}
+
+	// 获取请求信息
+	method := c.Request.Method
+	path := c.Request.URL.Path
+
+	// 1. 一次性解析并处理：模型映射 + stream 检查
+	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
+
+	logger.Info("[OpenAIProxy] Handling %s request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
+
+	if isStream {
+		return p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+	}
+
+	return p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+}
+
+// HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
+func (p *OpenAIProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+	startTime := time.Now()
+	var firstTokenTime time.Time
+
+	// 生成请求ID
+	requestID := c.GetHeader("X-Request-ID")
+	if requestID == "" {
+		requestID = c.GetString("request_id")
+	}
+
+	// 获取请求信息
+	method := c.Request.Method
+	path := c.Request.URL.Path
+
+	// 1. 转换并处理：Anthropic → OpenAI + 模型映射 + stream 检查
+	modifiedBody, modelName, isStream := p.convertAndProcessAnthropicRequest(reqBody)
+
+	logger.Info("[OpenAIProxy] Handling %s Anthropic request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
+
+	if isStream {
+		return p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+	}
+
+	return p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+}
+
+// handleOpenAIStreamingResponse 处理流式响应
+func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) error {
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// 设置请求头
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	// 设置流式响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming not supported")
+	}
+
+	// 流式转发
+	var inputTokens, outputTokens int
+	var responseBody strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	buf := scannerBufferPool.Get().([]byte)
+	defer func() { scannerBufferPool.Put(buf) }()
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if firstTokenTime.IsZero() {
+			*firstTokenTime = time.Now()
+		}
+
+		c.Writer.WriteString(line)
+		if line != "" {
+			c.Writer.WriteString("\n")
+		}
+		flusher.Flush()
+
+		// 收集响应体（限制大小）
+		if responseBody.Len() < 100*1024 { // 限制 100KB
+			responseBody.WriteString(line)
+			if line != "" {
+				responseBody.WriteString("\n")
+			}
+		}
+
+		// 提取 token 统计
+		inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan stream: %w", err)
+	}
+
+	// 记录统计
+	duration := time.Since(startTime).Milliseconds()
+	var timeToFirst int64
+	if firstTokenTime != nil && !firstTokenTime.IsZero() {
+		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
+	}
+	cost := calculateCost(modelName, inputTokens, outputTokens)
+
+	keyID, clientIP := GetAuthInfo(c)
+	if clientIP == "" {
+		clientIP = c.ClientIP()
+	}
+
+	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "stream", "ccproxy",
+		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
+
+	// 记录 history
+	responseBodyStr := responseBody.String()
+	if responseBody.Len() >= 100*1024 {
+		responseBodyStr += "\n... (truncated)"
+	}
+
+	history.AddRecord(history.RequestRecord{
+		ID:           requestID,
+		Timestamp:    startTime,
+		Method:       method,
+		Path:         path,
+		ClientIP:     clientIP,
+		KeyID:        keyID,
+		Provider:     p.provider.Name,
+		Model:        modelName,
+		StatusCode:   resp.StatusCode,
+		Duration:     duration,
+		RequestBody:  requestBody,
+		ResponseBody: responseBodyStr,
+		RequestHeaders: c.Request.Header,
+		ResponseHeaders: resp.Header,
+		RequestSize:  int64(len(requestBody)),
+		ResponseSize: int64(responseBody.Len()),
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  inputTokens + outputTokens,
+		Cost:         cost,
+	})
+
+	logger.Info("✅ OpenAI stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms", modelName, inputTokens, outputTokens, duration)
+
+	return nil
+}
+
+// handleOpenAINonStreamingResponse 处理非流式响应
+func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) error {
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := readResponseBody(resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))
+	}
+
+	// 解析 token 统计
+	_, inputTokens, outputTokens := parseTokenStats(respBytes)
+
+	// 设置响应头并返回
+	c.Header("Content-Type", "application/json")
+	c.Data(200, "application/json", respBytes)
+
+	// 记录统计
+	duration := time.Since(startTime).Milliseconds()
+	cost := calculateCost(modelName, inputTokens, outputTokens)
+
+	keyID, clientIP := GetAuthInfo(c)
+	if clientIP == "" {
+		clientIP = c.ClientIP()
+	}
+
+	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "non-stream", "ccproxy",
+		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
+
+	// 记录 history
+	history.AddRecord(history.RequestRecord{
+		ID:           requestID,
+		Timestamp:    startTime,
+		Method:       method,
+		Path:         path,
+		ClientIP:     clientIP,
+		KeyID:        keyID,
+		Provider:     p.provider.Name,
+		Model:        modelName,
+		StatusCode:   resp.StatusCode,
+		Duration:     duration,
+		RequestBody:  requestBody,
+		ResponseBody: string(respBytes),
+		RequestHeaders: c.Request.Header,
+		ResponseHeaders: resp.Header,
+		RequestSize:  int64(len(requestBody)),
+		ResponseSize: int64(len(respBytes)),
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  inputTokens + outputTokens,
+		Cost:         cost,
+	})
+
+	logger.Info("✅ OpenAI non-stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms", modelName, inputTokens, outputTokens, duration)
+
+	return nil
 }

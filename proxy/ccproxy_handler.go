@@ -6,11 +6,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
-	"switchai/history"
 	"switchai/logger"
-	"switchai/stats"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -19,7 +16,6 @@ import (
 // baseProxyHandlerWithCcProxy 使用 CcProxy 接口的代理处理逻辑
 // 优化：Handler 只负责认证和传递原始请求，所有转换由 Proxy 内部处理
 func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
-	startTime := time.Now()
 	requestID := uuid.New().String()
 
 	// 1. 认证
@@ -52,215 +48,45 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 	}
 
 	// 4. 根据请求格式选择调用方式（传递原始请求头和请求体）
+	// HandleXxxFormat 内部处理：模型映射、格式转换、发送请求、响应转发、统计记录
+	// 将认证信息存储到 gin.Context 中，供 Proxy 方法读取
+	c.Set("keyID", keyID)
+	c.Set("clientIP", clientIP)
+
 	ctx := context.Background()
 	if cfg.isIncomingOpenAIFormat {
-		entry.handleOpenAIRequest(ctx, c, c.Request.Header, bodyBytes, requestID, startTime, keyID, clientIP)
-	} else {
-		entry.handleAnthropicRequest(ctx, c, c.Request.Header, bodyBytes, requestID, startTime, keyID, clientIP)
-	}
-}
-
-// handleOpenAIRequest 处理 OpenAI 格式请求
-func (e *ConnProxyEntry) handleOpenAIRequest(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte, requestID string, startTime time.Time, keyID, clientIP string) {
-	// 调用 Proxy（内部处理模型映射、格式转换、流式判断）
-	resp := e.Proxy.SendOpenAIFormat(ctx, reqHdr, reqBody)
-
-	if resp.Error != nil {
-		logger.Error("❌ Proxy request failed: %v", resp.Error)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "Proxy request failed: " + resp.Error.Error()})
-		return
-	}
-
-	// 根据响应类型处理（使用 resp.ModelName）
-	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, "", reqBody)
-	} else {
-		e.handleNonStreamResponse(c, resp.Body, resp.ModelName, requestID, startTime, keyID, clientIP, reqBody)
-	}
-}
-
-// handleAnthropicRequest 处理 Anthropic 格式请求
-func (e *ConnProxyEntry) handleAnthropicRequest(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte, requestID string, startTime time.Time, keyID, clientIP string) {
-	// 调用 Proxy（内部处理模型映射、格式转换、流式判断）
-	resp := e.Proxy.SendAnthropicFormat(ctx, reqHdr, reqBody)
-
-	if resp.Error != nil {
-		logger.Error("❌ Proxy request failed: %v", resp.Error)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "Proxy request failed: " + resp.Error.Error()})
-		return
-	}
-
-	// 处理响应格式转换（OpenAI -> Anthropic）
-	// 注意：流式响应的 resp.Body 是空的，转换在 handleStreamResponse 中逐块处理
-	responseBody := resp.Body
-	if resp.ConvertResponseFormat == "anthropic" && !resp.IsStream {
-		converted, err := convertOpenAIResponseToAnthropic(resp.Body)
-		if err != nil {
-			logger.Error("❌ Response format conversion failed: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Response conversion failed"})
-			return
+		if err := entry.Proxy.HandleOpenAIFormat(ctx, c, c.Request.Header, bodyBytes); err != nil {
+			logger.Error("❌ HandleOpenAIFormat failed: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
 		}
-		responseBody = converted
-		logger.Info("✅ Response converted: OpenAI -> Anthropic (non-stream)")
-	}
-
-	// 根据响应类型处理（使用 resp.ModelName）
-	if resp.IsStream {
-		e.handleStreamResponse(c, resp.StreamCh, resp.ErrCh, resp.ModelName, requestID, startTime, keyID, clientIP, resp.ConvertResponseFormat, reqBody)
 	} else {
-		e.handleNonStreamResponse(c, responseBody, resp.ModelName, requestID, startTime, keyID, clientIP, reqBody)
-	}
-}
-
-// handleNonStreamResponse 处理非流式响应
-func (e *ConnProxyEntry) handleNonStreamResponse(c *gin.Context, respBody []byte, modelName string, requestID string, startTime time.Time, keyID, clientIP string, reqBody []byte) {
-	// 解析响应获取 token 统计
-	_, inputTokens, outputTokens := parseTokenStats(respBody)
-
-	// 使用 Proxy 提供的模型名（如果为空则使用 "unknown"）
-	model := modelName
-	if model == "" {
-		model = "unknown"
-	}
-
-	// 设置响应头并返回（直接使用 []byte，避免额外拷贝）
-	c.Header("Content-Type", "application/json")
-	c.Data(200, "application/json", respBody)
-
-	// 记录统计
-	duration := time.Since(startTime).Milliseconds()
-	cost := calculateCost(model, inputTokens, outputTokens)
-
-	logZeroTokenDebug(e.Provider.Name, requestID, string(reqBody), string(respBody), inputTokens, outputTokens)
-
-	stats.RecordUsage(e.Provider.ID, e.Provider.Name, model, "non-stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
-
-	history.AddRecord(history.RequestRecord{
-		ID:              requestID,
-		Timestamp:       startTime,
-		Method:          c.Request.Method,
-		Path:            c.Request.URL.Path,
-		ClientIP:        clientIP,
-		KeyID:           keyID,
-		Provider:        e.Provider.Name,
-		Model:           model,
-		StatusCode:      200,
-		Duration:        duration,
-		RequestBody:     "",
-		ResponseHeaders: make(http.Header),
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		TotalTokens:     inputTokens + outputTokens,
-		Cost:            cost,
-	})
-
-	logger.Info("✅ 非流式响应完成: Model=%s, Tokens=%d+%d, Cost=$%.4f, Duration=%dms",
-		model, inputTokens, outputTokens, cost, duration)
-}
-
-// handleStreamResponse 处理流式响应
-func (e *ConnProxyEntry) handleStreamResponse(c *gin.Context, ch <-chan string, errCh <-chan error, modelName string, requestID string, startTime time.Time, keyID, clientIP string, convertResponseFormat string, reqBody []byte) {
-	// 设置流式响应头
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		logger.Error("Streaming not supported")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Streaming not supported"})
-		return
-	}
-
-	var firstTokenTime time.Time
-	firstToken := true
-	var inputTokens, outputTokens int
-
-	// 处理流式响应
-	for {
-		select {
-		case line, ok := <-ch:
-			if !ok {
-				goto done
-			}
-
-			if firstToken {
-				firstTokenTime = time.Now()
-				firstToken = false
-			}
-
-			// 处理 SSE 行：如果需要转换则转换，否则直接转发
-			outputLine := line
-			if convertResponseFormat == "anthropic" {
-				converted := convertOpenAIStreamLineToAnthropic(line)
-				if converted != "" {
-					outputLine = converted
-				}
-			}
-
-			c.Writer.WriteString(outputLine)
-			flusher.Flush()
-
-			// 提取 token 统计（使用原始行）
-			inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
-
-		case err := <-errCh:
-			if err != nil {
-				logger.Error("❌ Stream error: %v", err)
-				return
-			}
-			goto done
+		if err := entry.Proxy.HandleAnthropicFormat(ctx, c, c.Request.Header, bodyBytes); err != nil {
+			logger.Error("❌ HandleAnthropicFormat failed: %v", err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
 		}
 	}
-
-done:
-	// 使用 Proxy 提供的模型名（如果为空则使用 "unknown"）
-	model := modelName
-	if model == "" {
-		model = "unknown"
-	}
-
-	// 记录统计
-	duration := time.Since(startTime).Milliseconds()
-	var timeToFirst int64
-	if !firstTokenTime.IsZero() {
-		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
-	}
-
-	cost := calculateCost(model, inputTokens, outputTokens)
-
-	logZeroTokenDebug(e.Provider.Name, requestID, string(reqBody), "", inputTokens, outputTokens)
-
-	stats.RecordUsage(e.Provider.ID, e.Provider.Name, model, "stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
-
-	history.AddRecord(history.RequestRecord{
-		ID:              requestID,
-		Timestamp:       startTime,
-		Method:          c.Request.Method,
-		Path:            c.Request.URL.Path,
-		ClientIP:        clientIP,
-		KeyID:           keyID,
-		Provider:        e.Provider.Name,
-		Model:           model,
-		StatusCode:      200,
-		Duration:        duration,
-		RequestBody:     "",
-		ResponseHeaders: make(http.Header),
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		TotalTokens:     inputTokens + outputTokens,
-		Cost:            cost,
-	})
-
-	logger.Info("✅ 流式响应完成: Model=%s, Tokens=%d+%d, Cost=$%.4f, Duration=%dms, TTFB=%dms",
-		model, inputTokens, outputTokens, cost, duration, timeToFirst)
 }
 
 // ============================================================
 // 辅助函数
 // ============================================================
+
+// GetAuthInfo 从 gin.Context 中获取认证信息
+func GetAuthInfo(c *gin.Context) (keyID, clientIP string) {
+	keyID = ""
+	if v, exists := c.Get("keyID"); exists {
+		if k, ok := v.(string); ok {
+			keyID = k
+		}
+	}
+	clientIP = ""
+	if v, exists := c.Get("clientIP"); exists {
+		if ip, ok := v.(string); ok {
+			clientIP = ip
+		}
+	}
+	return keyID, clientIP
+}
 
 // parseTokenStats 从响应体中解析 token 统计（不再解析 model）
 func parseTokenStats(respBody []byte) (string, int, int) {
@@ -296,17 +122,8 @@ func parseTokenStats(respBody []byte) (string, int, int) {
 	return "", inputTokens, outputTokens
 }
 
-// extractTokensFromSSE 从 SSE 行中提取 token 统计（不再提取 model）
-func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int) {
-	if !strings.HasPrefix(line, "data: ") {
-		return inputTokens, outputTokens
-	}
-
-	data := strings.TrimPrefix(line, "data: ")
-	if data == "[DONE]" {
-		return inputTokens, outputTokens
-	}
-
+// parseUsageFromJSON 从 JSON 字符串中解析 usage（OpenAI 或 Anthropic 格式）
+func parseUsageFromJSON(data string, inputTokens, outputTokens int) (int, int) {
 	var event map[string]interface{}
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
 		return inputTokens, outputTokens
@@ -320,11 +137,103 @@ func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int)
 		if ct, ok := usage["completion_tokens"].(float64); ok && ct > 0 {
 			outputTokens = int(ct)
 		}
+		return inputTokens, outputTokens
 	}
 
 	// Anthropic 格式
-	if inputTokens == 0 && outputTokens == 0 {
-		if usage, ok := event["usage"].(map[string]interface{}); ok {
+	if usage, ok := event["usage"].(map[string]interface{}); ok {
+		if it, ok := usage["input_tokens"].(float64); ok && it > 0 {
+			inputTokens = int(it)
+		}
+		if ot, ok := usage["output_tokens"].(float64); ok && ot > 0 {
+			outputTokens = int(ot)
+		}
+	}
+
+	return inputTokens, outputTokens
+}
+
+// extractTokensFromSSE 从 SSE 行中提取 token 统计
+// 优化 1: 区分 Anthropic SSE 事件类型（message_start 只取 input_tokens，message_delta 只取 output_tokens）
+// 优化 2: 处理非标准情况（上游在流式请求中直接返回非流式 JSON）
+func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int) {
+	line = strings.TrimSpace(line)
+
+	// 检查是否为空行
+	if line == "" {
+		return inputTokens, outputTokens
+	}
+
+	// 1. 标准 SSE 格式
+	var data string
+	var isSSE bool
+
+	if strings.HasPrefix(line, "data: ") {
+		data = strings.TrimPrefix(line, "data: ")
+		isSSE = true
+		if data == "[DONE]" {
+			return inputTokens, outputTokens
+		}
+	} else {
+		// 2. 非标准情况：上游在流式请求中直接返回非流式 JSON
+		// 检测是否为 JSON 对象（以 { 开头）
+		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
+			data = line
+			isSSE = false
+		} else {
+			return inputTokens, outputTokens
+		}
+	}
+
+	var event map[string]interface{}
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return inputTokens, outputTokens
+	}
+
+	// 优化: 区分 Anthropic SSE 事件类型，精确捕获
+	if isSSE {
+		if eventType, ok := event["type"].(string); ok {
+			switch eventType {
+			case "message_start":
+				// 只捕获 input_tokens（最终值），此时 output_tokens=0 是占位，不应记录
+				if usage, ok := event["usage"].(map[string]interface{}); ok {
+					if it, ok := usage["input_tokens"].(float64); ok {
+						inputTokens = int(it)
+					}
+					// cache tokens 也从这里获取
+					if cacheRead, ok := usage["cache_read_input_tokens"].(float64); ok && cacheRead > 0 {
+						// 可选：记录 cache_read_tokens
+					}
+				}
+				return inputTokens, outputTokens
+
+			case "message_delta":
+				// 只捕获 output_tokens（最终值）
+				if usage, ok := event["usage"].(map[string]interface{}); ok {
+					if ot, ok := usage["output_tokens"].(float64); ok {
+						outputTokens = int(ot)
+					}
+				}
+				return inputTokens, outputTokens
+			}
+		}
+	}
+
+	// 3. OpenAI 格式或其他格式（非 Anthropic SSE 事件）
+	// 兼容处理：同时检查 prompt_tokens/completion_tokens 和 input_tokens/output_tokens
+	if usage, ok := event["usage"].(map[string]interface{}); ok {
+		foundOpenAI := false
+		// OpenAI 格式
+		if pt, ok := usage["prompt_tokens"].(float64); ok && pt > 0 {
+			inputTokens = int(pt)
+			foundOpenAI = true
+		}
+		if ct, ok := usage["completion_tokens"].(float64); ok && ct > 0 {
+			outputTokens = int(ct)
+			foundOpenAI = true
+		}
+		// Anthropic 格式（当 OpenAI 格式没有匹配到时）
+		if !foundOpenAI {
 			if it, ok := usage["input_tokens"].(float64); ok && it > 0 {
 				inputTokens = int(it)
 			}

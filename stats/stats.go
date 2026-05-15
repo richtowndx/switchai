@@ -207,7 +207,10 @@ func maskKeyID(keyID string) string {
 }
 
 func RecordUsage(providerID, providerName, model, group, reqType string, inputTokens, outputTokens int, cost float64, duration, timeToFirst int64, keyID, clientIP string) {
+	logger.Info("RecordUsage START: provider=%s, model=%s, input=%d, output=%d, keyID=%s", providerID, model, inputTokens, outputTokens, keyID)
+
 	if db == nil {
+		logger.Error("RecordUsage: db is nil! Stats not initialized.")
 		return
 	}
 
@@ -327,6 +330,7 @@ func RecordUsage(providerID, providerName, model, group, reqType string, inputTo
 		logger.Error("Failed to commit transaction: %v", err)
 		return
 	}
+	logger.Info("RecordUsage: Transaction committed, DB write successful")
 
 	// Log
 	record := UsageRecord{

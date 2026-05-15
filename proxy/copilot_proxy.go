@@ -3,15 +3,22 @@ package proxy
 import (
 	"bytes"
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"switchai/config"
+	"switchai/history"
 	"switchai/logger"
+	"switchai/stats"
+
+	"github.com/andybalholm/brotli"
+	"github.com/gin-gonic/gin"
 )
 
 func init() {
@@ -101,6 +108,41 @@ func (p *CopilotProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Head
 	resp.ModelName = modelName
 		resp.ConvertResponseFormat = "anthropic"
 	return resp
+}
+
+// HandleOpenAIFormat 处理 OpenAI 格式请求（包括发送和响应转发）
+func (p *CopilotProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+	startTime := time.Now()
+	var firstTokenTime time.Time
+
+	// 生成请求ID
+	requestID := c.GetHeader("X-Request-ID")
+	if requestID == "" {
+		requestID = c.GetString("request_id")
+	}
+
+	// 获取请求信息
+	method := c.Request.Method
+	path := c.Request.URL.Path
+
+	// 1. 过滤不支持的参数
+	reqBody = FilterUnsupportedParams(reqBody, "copilot")
+
+	// 2. 处理模型映射并获取映射后的模型名
+	modifiedBody, modelName := p.applyModelMapping(reqBody)
+
+	// 3. 解析请求检查是否为流式
+	var req map[string]interface{}
+	_ = json.Unmarshal(modifiedBody, &req)
+	isStream, _ := req["stream"].(bool)
+
+	logger.Info("[CopilotProxy] Handling %s OpenAI request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
+
+	if isStream {
+		return p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+	}
+
+	return p.handleCopilotNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
 }
 
 // Close 释放资源
@@ -234,11 +276,29 @@ func (p *CopilotProxy) sendCopilotStream(ctx context.Context, reqBody []byte) *P
 			return
 		}
 
-		scanner := bufio.NewScanner(resp.Body)
+		// 处理 Content-Encoding: gzip/brotli
+		var reader io.Reader = resp.Body
+		contentEncoding := resp.Header.Get("Content-Encoding")
+		if contentEncoding != "" && contentEncoding != "identity" {
+			switch strings.ToLower(contentEncoding) {
+			case "gzip":
+				gzReader, err := gzip.NewReader(resp.Body)
+				if err != nil {
+					errCh <- fmt.Errorf("gzip decompress: %w", err)
+					return
+				}
+				defer gzReader.Close()
+				reader = gzReader
+			case "br":
+				reader = brotli.NewReader(resp.Body)
+			}
+		}
+
+		scanner := bufio.NewScanner(reader)
 		// 使用 buffer pool 减少 memory allocation
 		buf := scannerBufferPool.Get().([]byte)
 		defer func() { scannerBufferPool.Put(buf) }()
-		
+
 		scanner.Buffer(buf, 1024*1024)
 
 		for scanner.Scan() {
@@ -260,6 +320,281 @@ func (p *CopilotProxy) sendCopilotStream(ctx context.Context, reqBody []byte) *P
 
 func (p *CopilotProxy) buildURL() string {
 	return CopilotTargetURL(p.provider)
+}
+
+// HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
+// Copilot 需要：Anthropic → OpenAI 转换 → 发送 → OpenAI → Anthropic 转换 → 转发
+func (p *CopilotProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+	startTime := time.Now()
+	var firstTokenTime time.Time
+
+	// 生成请求ID
+	requestID := c.GetHeader("X-Request-ID")
+	if requestID == "" {
+		requestID = c.GetString("request_id")
+	}
+
+	// 获取请求信息
+	method := c.Request.Method
+	path := c.Request.URL.Path
+
+	// 1. 转换 Anthropic -> OpenAI
+	openaiBody, modelName, err := p.convertAnthropicToOpenAI(reqBody)
+	if err != nil {
+		return err
+	}
+
+	logger.Info("Converted Anthropic->OpenAI body: %s", string(openaiBody))
+
+	// 2. 过滤不支持的参数
+	openaiBody = FilterUnsupportedParams(openaiBody, "copilot")
+
+	// 3. 处理模型映射并获取映射后的模型名
+	modifiedBody, mappedName := p.applyModelMapping(openaiBody)
+	if mappedName != "" {
+		modelName = mappedName
+	}
+
+	// 4. 解析请求检查是否为流式
+	var req map[string]interface{}
+	_ = json.Unmarshal(modifiedBody, &req)
+	isStream, _ := req["stream"].(bool)
+
+	logger.Info("[CopilotProxy] Handling %s Anthropic request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
+
+	if isStream {
+		return p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+	}
+
+	return p.handleCopilotNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+}
+
+// handleCopilotNonStreamingResponse 处理 Copilot 非流式响应
+func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) error {
+	// 获取 Copilot token
+	copilotToken := RefreshCopilotToken(p.provider)
+	if copilotToken == "" {
+		logger.Error("Failed to get Copilot token for provider %s", p.provider.Name)
+		return fmt.Errorf("failed to get Copilot token")
+	}
+	logger.Info("Using Copilot token (length: %d, prefix: %s)", len(copilotToken), copilotToken[:10])
+
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// 注入 Copilot headers
+	for k, v := range InjectCopilotHeaders(nil, copilotToken) {
+		for _, val := range v {
+			req.Header.Add(k, val)
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := readResponseBody(resp)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))
+	}
+
+	// 转换 OpenAI 响应 -> Anthropic 格式
+	anthropicResp, err := convertOpenAIResponseToAnthropic(respBytes)
+	if err != nil {
+		logger.Error("Response conversion failed: %v", err)
+		return err
+	}
+
+	// 解析 token 统计
+	_, inputTokens, outputTokens := parseTokenStats(anthropicResp)
+
+	// 设置响应头并返回
+	c.Header("Content-Type", "application/json")
+	c.Data(200, "application/json", anthropicResp)
+
+	// 记录统计
+	duration := time.Since(startTime).Milliseconds()
+	cost := calculateCost(modelName, inputTokens, outputTokens)
+
+	keyID, clientIP := GetAuthInfo(c)
+	if clientIP == "" {
+		clientIP = c.ClientIP()
+	}
+
+	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "non-stream", "ccproxy",
+		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
+
+	// 记录 history（记录转换后的响应）
+	history.AddRecord(history.RequestRecord{
+		ID:           requestID,
+		Timestamp:    startTime,
+		Method:       method,
+		Path:         path,
+		ClientIP:     clientIP,
+		KeyID:        keyID,
+		Provider:     p.provider.Name,
+		Model:        modelName,
+		StatusCode:   resp.StatusCode,
+		Duration:     duration,
+		RequestBody:  requestBody,
+		ResponseBody: string(anthropicResp),
+		RequestHeaders: c.Request.Header,
+		ResponseHeaders: resp.Header,
+		RequestSize:  int64(len(requestBody)),
+		ResponseSize: int64(len(anthropicResp)),
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  inputTokens + outputTokens,
+		Cost:         cost,
+	})
+
+	logger.Info("✅ Copilot non-stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms", modelName, inputTokens, outputTokens, duration)
+
+	return nil
+}
+
+// handleCopilotStreamingResponse 处理 Copilot 流式响应
+func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) error {
+	// 获取 Copilot token
+	copilotToken := RefreshCopilotToken(p.provider)
+	if copilotToken == "" {
+		return fmt.Errorf("failed to get Copilot token")
+	}
+
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// 注入 Copilot headers
+	for k, v := range InjectCopilotHeaders(nil, copilotToken) {
+		for _, val := range v {
+			req.Header.Add(k, val)
+		}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	// 设置流式响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming not supported")
+	}
+
+	// 处理 Content-Encoding: gzip/brotli
+	var reader io.Reader = resp.Body
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	if contentEncoding != "" && contentEncoding != "identity" {
+		switch strings.ToLower(contentEncoding) {
+		case "gzip":
+			gzReader, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				return fmt.Errorf("gzip decompress: %w", err)
+			}
+			defer gzReader.Close()
+			reader = gzReader
+		case "br":
+			reader = brotli.NewReader(resp.Body)
+		}
+	}
+
+	// 流式转发 + 格式转换
+	var inputTokens, outputTokens int
+	scanner := bufio.NewScanner(reader)
+	buf := scannerBufferPool.Get().([]byte)
+	defer func() { scannerBufferPool.Put(buf) }()
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if firstTokenTime != nil && firstTokenTime.IsZero() {
+			*firstTokenTime = time.Now()
+		}
+
+		// 转换 OpenAI SSE -> Anthropic SSE
+		convertedLine := convertOpenAIStreamLineToAnthropic(line)
+		c.Writer.WriteString(convertedLine)
+		flusher.Flush()
+
+		// 提取 token 统计（使用原始行）
+		inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan stream: %w", err)
+	}
+
+	// 记录统计
+	duration := time.Since(startTime).Milliseconds()
+	var timeToFirst int64
+	if !firstTokenTime.IsZero() {
+		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
+	}
+	cost := calculateCost(modelName, inputTokens, outputTokens)
+
+	keyID, clientIP := GetAuthInfo(c)
+	if clientIP == "" {
+		clientIP = c.ClientIP()
+	}
+
+	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "stream", "ccproxy",
+		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
+
+	// 记录 history（记录转换后的响应）
+	// 注意：这里没有收集完整的流式响应体，因为转换后的响应大小可能很大
+	history.AddRecord(history.RequestRecord{
+		ID:           requestID,
+		Timestamp:    startTime,
+		Method:       method,
+		Path:         path,
+		ClientIP:     clientIP,
+		KeyID:        keyID,
+		Provider:     p.provider.Name,
+		Model:        modelName,
+		StatusCode:   200, // 流式响应假设成功
+		Duration:     duration,
+		RequestBody:  requestBody,
+		ResponseBody: "(streaming response not logged)",
+		RequestHeaders: c.Request.Header,
+		ResponseHeaders: nil, // 流式响应头已经在上面设置过了
+		RequestSize:  int64(len(requestBody)),
+		ResponseSize: 0,
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+		TotalTokens:  inputTokens + outputTokens,
+		Cost:         cost,
+	})
+
+	logger.Info("✅ Copilot stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms, TTFB=%dms",
+		modelName, inputTokens, outputTokens, duration, timeToFirst)
+
+	return nil
 }
 
 // ============================================================

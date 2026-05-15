@@ -7,6 +7,8 @@ import (
 	"sync"
 
 	"switchai/config"
+
+	"github.com/gin-gonic/gin"
 )
 
 // scannerBufferPool 用于流式响应扫描的 buffer 池，减少内存分配
@@ -38,15 +40,17 @@ type ProxyResponse struct {
 }
 
 // CcProxy 定义统一的代理接口
-// 优化设计：Handler 不需要知道 stream 逻辑，各 Proxy 内部根据请求参数处理
+// 优化设计：Proxy 内部处理完整的请求-响应周期，包括格式转换和响应转发
 type CcProxy interface {
-	// SendOpenAIFormat 发送 OpenAI 格式请求
-	// 返回：根据 stream 参数返回非流式或流式响应
-	SendOpenAIFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse
+	// HandleOpenAIFormat 处理 OpenAI 格式请求（包括发送和响应转发）
+	// 内部处理：模型映射、发送请求、响应转发
+	// 返回：error（如果处理失败）
+	HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error
 
-	// SendAnthropicFormat 发送 Anthropic 格式请求
-	// 返回：根据 stream 参数返回非流式或流式响应
-	SendAnthropicFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse
+	// HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
+	// 内部处理：模型映射、格式转换、发送请求、响应转换、响应转发
+	// 返回：error（如果处理失败）
+	HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error
 
 	// Close 释放代理资源
 	Close() error

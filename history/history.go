@@ -215,6 +215,15 @@ func cleanupOldRecords() {
 			logger.Info("Cleaned up %d old history records", deleteCount)
 		}
 	}
+
+	// 删除30天前的记录
+	thirtyDaysAgo := time.Now().AddDate(0, 0, -30).UnixNano()
+	result, err := db.Exec(`DELETE FROM history WHERE timestamp < ?`, thirtyDaysAgo)
+	if err != nil {
+		logger.Error("Failed to delete old history records (>30 days): %v", err)
+	} else if rowsAffected, _ := result.RowsAffected(); rowsAffected > 0 {
+		logger.Info("Deleted %d history records older than 30 days", rowsAffected)
+	}
 }
 
 func Shutdown() {
