@@ -49,9 +49,10 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 
 	// 4. 根据请求格式选择调用方式（传递原始请求头和请求体）
 	// HandleXxxFormat 内部处理：模型映射、格式转换、发送请求、响应转发、统计记录
-	// 将认证信息存储到 gin.Context 中，供 Proxy 方法读取
+	// 将认证信息和请求ID存储到 gin.Context 中，供 Proxy 方法读取
 	c.Set("keyID", keyID)
 	c.Set("clientIP", clientIP)
+	c.Set("request_id", requestID)
 
 	ctx := context.Background()
 	if cfg.isIncomingOpenAIFormat {

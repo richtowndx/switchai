@@ -483,6 +483,9 @@ func GetRecordsSummary(page, pageSize int) ([]RecordSummary, int) {
 	}
 
 	// 第1页且请求大小不超过缓存大小时，使用缓存
+	// 移除缓存逻辑以确保分页一致性：始终使用数据库查询
+	// 避免因 homeCacheTotal 和实际数据库记录数不同步导致的分页错误
+	/*
 	if page == 1 && pageSize <= homeCacheSize {
 		homeCacheMu.RLock()
 		defer homeCacheMu.RUnlock()
@@ -510,6 +513,7 @@ func GetRecordsSummary(page, pageSize int) ([]RecordSummary, int) {
 		}
 		return summaries, homeCacheTotal
 	}
+	*/
 
 	// Get total count
 	var total int
