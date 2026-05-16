@@ -368,7 +368,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 	}
 
 	// 流式转发
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cacheReadTokens int
 	var responseBody strings.Builder
 	scanner := bufio.NewScanner(resp.Body)
 	buf := scannerBufferPool.Get().([]byte)
@@ -396,7 +396,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 		}
 
 		// 提取 token 统计
-		inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
+		inputTokens, outputTokens, cacheReadTokens = extractTokensFromSSE(line, inputTokens, outputTokens, cacheReadTokens)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -409,7 +409,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 	if firstTokenTime != nil && !firstTokenTime.IsZero() {
 		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
 	}
-	cost := calculateCost(modelName, inputTokens, outputTokens)
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
 
 	keyID, clientIP := GetAuthInfo(c)
 	if clientIP == "" {
@@ -417,7 +417,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 	}
 
 	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, timeToFirst, keyID, clientIP)
 
 	// 记录 history
 	responseBodyStr := responseBody.String()
@@ -442,9 +442,10 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 		ResponseHeaders: resp.Header,
 		RequestSize:  int64(len(requestBody)),
 		ResponseSize: int64(responseBody.Len()),
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  inputTokens + outputTokens,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:         cost,
 	})
 
@@ -480,7 +481,7 @@ func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *g
 	}
 
 	// 解析 token 统计
-	_, inputTokens, outputTokens := parseTokenStats(respBytes)
+	_, inputTokens, outputTokens, cacheReadTokens := parseTokenStats(respBytes)
 
 	// 设置响应头并返回
 	c.Header("Content-Type", "application/json")
@@ -488,7 +489,7 @@ func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *g
 
 	// 记录统计
 	duration := time.Since(startTime).Milliseconds()
-	cost := calculateCost(modelName, inputTokens, outputTokens)
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
 
 	keyID, clientIP := GetAuthInfo(c)
 	if clientIP == "" {
@@ -496,7 +497,7 @@ func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *g
 	}
 
 	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "non-stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, 0, keyID, clientIP)
 
 	// 记录 history
 	history.AddRecord(history.RequestRecord{
@@ -516,9 +517,10 @@ func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *g
 		ResponseHeaders: resp.Header,
 		RequestSize:  int64(len(requestBody)),
 		ResponseSize: int64(len(respBytes)),
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  inputTokens + outputTokens,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:         cost,
 	})
 

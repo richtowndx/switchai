@@ -370,7 +370,7 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cacheReadTokens int
 	var model string
 	firstToken := true
 	var responseBody strings.Builder
@@ -404,14 +404,7 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 						c.Writer.Write([]byte(claudeLine))
 						flusher.Flush()
 						responseBody.WriteString(claudeLine)
-						if usage, ok := claudeChunk["usage"].(map[string]interface{}); ok {
-							if input, ok := usage["input_tokens"].(int); ok {
-								inputTokens = input
-							}
-							if output, ok := usage["output_tokens"].(int); ok {
-								outputTokens = output
-							}
-						}
+						// token 提取在通用逻辑中处理
 					}
 				}
 			} else {
@@ -444,14 +437,7 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 						c.Writer.Write([]byte(openaiLine))
 						flusher.Flush()
 						responseBody.WriteString(openaiLine)
-						if usage, ok := claudeChunk["usage"].(map[string]interface{}); ok {
-							if input, ok := usage["input_tokens"].(float64); ok {
-								inputTokens = int(input)
-							}
-							if output, ok := usage["output_tokens"].(float64); ok {
-								outputTokens = int(output)
-							}
-						}
+						// token 提取在通用逻辑中处理
 					}
 				}
 			} else {
@@ -468,24 +454,52 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 			flusher.Flush()
 			responseBody.Write(line)
 			responseBody.WriteString("\n")
+		}
 
-			lineStr := string(line)
-			if strings.HasPrefix(lineStr, "data: ") {
-				data := strings.TrimPrefix(lineStr, "data: ")
-				if data == "[DONE]" {
-					continue
-				}
+		// 提取 token 统计（所有格式通用）
+		lineStr := string(line)
+		lineStr = strings.TrimSpace(lineStr)
+
+		if strings.HasPrefix(lineStr, "data: ") {
+			data := strings.TrimPrefix(lineStr, "data: ")
+			if data == "[DONE]" {
+				// continue
+			} else {
 				var streamData map[string]interface{}
 				if err := json.Unmarshal([]byte(data), &streamData); err == nil {
 					if m, ok := streamData["model"].(string); ok && m != "" {
 						model = m
 					}
-					if usage, ok := streamData["usage"].(map[string]interface{}); ok {
-						if input, ok := usage["input_tokens"].(float64); ok {
-							inputTokens = int(input)
-						}
-						if output, ok := usage["output_tokens"].(float64); ok {
-							outputTokens = int(output)
+					// Distinguish Anthropic SSE event types
+					if eventType, ok := streamData["type"].(string); ok {
+						switch eventType {
+							case "message_start":
+								// 不提取 token，所有 token 数据由 message_delta 提供
+						case "message_delta":
+							if usage, ok := streamData["usage"].(map[string]interface{}); ok {
+								if ot, ok := usage["output_tokens"].(float64); ok {
+									outputTokens = int(ot)
+								}
+								if it, ok := usage["input_tokens"].(float64); ok {
+									inputTokens = int(it)
+								}
+								if crt, ok := usage["cache_read_input_tokens"].(float64); ok {
+									cacheReadTokens = int(crt)
+								}
+							}
+						default:
+							// OpenAI or other format: extract usage directly
+							if usage, ok := streamData["usage"].(map[string]interface{}); ok {
+								if input, ok := usage["input_tokens"].(float64); ok {
+									inputTokens = int(input)
+								}
+								if output, ok := usage["output_tokens"].(float64); ok {
+									outputTokens = int(output)
+								}
+								if cache, ok := usage["cache_read_input_tokens"].(float64); ok {
+									cacheReadTokens = int(cache)
+								}
+							}
 						}
 					}
 				}
@@ -509,11 +523,11 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 	if model == "" {
 		model = "unknown"
 	}
-	cost := calculateCost(model, inputTokens, outputTokens)
+	cost := calculateCost(model, inputTokens, outputTokens, cacheReadTokens)
 
 	logZeroTokenDebug(provider.Name, requestID, requestBody, responseBody.String(), inputTokens, outputTokens)
 
-	stats.RecordUsage(provider.ID, provider.Name, model, "stream", "claude", inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
+	stats.RecordUsage(provider.ID, provider.Name, model, "stream", "claude", inputTokens, outputTokens, cacheReadTokens, cost, duration, timeToFirst, keyID, clientIP)
 	history.AddRecord(history.RequestRecord{
 		ID: requestID, Timestamp: startTime, Method: method, Path: path,
 		ClientIP: clientIP, KeyID: keyID, Provider: provider.Name, Model: model,
@@ -522,7 +536,7 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 		RequestHeaders: requestHeaders, ResponseHeaders: resp.Header,
 		RequestSize: int64(len(requestBody)), ResponseSize: int64(responseBody.Len()),
 		InputTokens: inputTokens, OutputTokens: outputTokens,
-		TotalTokens: inputTokens + outputTokens, Cost: cost,
+		CacheReadInputTokens: cacheReadTokens, TotalTokens: inputTokens + outputTokens + cacheReadTokens, Cost: cost,
 	})
 }
 
@@ -552,15 +566,16 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *conf
 	}
 
 	model := requestedModel
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cacheReadTokens int
 	var responseBodyForHistory string
 
 	if resp.StatusCode == 200 && len(respBody) > 0 {
 		var result struct {
 			Model string `json:"model"`
 			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens          int `json:"input_tokens"`
+				OutputTokens         int `json:"output_tokens"`
+				CacheReadInputTokens int `json:"cache_read_input_tokens"`
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal(respBody, &result); err != nil {
@@ -571,6 +586,8 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *conf
 			}
 			inputTokens = result.Usage.InputTokens
 			outputTokens = result.Usage.OutputTokens
+			cacheReadTokens = result.Usage.CacheReadInputTokens
+				
 		}
 		responseBodyForHistory = string(respBody)
 	}
@@ -580,11 +597,11 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *conf
 	}
 
 	duration := time.Since(startTime).Milliseconds()
-	cost := calculateCost(model, inputTokens, outputTokens)
+	cost := calculateCost(model, inputTokens, outputTokens, cacheReadTokens)
 	logZeroTokenDebug(provider.Name, requestID, requestBody, responseBodyForHistory, inputTokens, outputTokens)
 
 	stats.RecordUsage(provider.ID, provider.Name, model, "non-stream", "claude",
-		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, 0, keyID, clientIP)
 	history.AddRecord(history.RequestRecord{
 		ID: requestID, Timestamp: startTime, Method: method, Path: path,
 		ClientIP: clientIP, KeyID: keyID, Provider: provider.Name, Model: model,
@@ -593,7 +610,7 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *conf
 		RequestHeaders: requestHeaders, ResponseHeaders: resp.Header,
 		RequestSize: int64(len(requestBody)), ResponseSize: int64(len(respBody)),
 		InputTokens: inputTokens, OutputTokens: outputTokens,
-		TotalTokens: inputTokens + outputTokens, Cost: cost,
+		CacheReadInputTokens: cacheReadTokens, TotalTokens: inputTokens + outputTokens + cacheReadTokens, Cost: cost,
 	})
 
 	// 格式转换（非流式）
@@ -671,22 +688,17 @@ func logZeroTokenDebug(providerName, requestID, requestBody, responseBody string
 }
 
 // ============================================================
-// 费用计算
+// 费用计算（统一定价，不区分模型）
+// 输入: 3元/百万token, 缓存读取: 0.025元/百万token, 输出: 6元/百万token
 // ============================================================
 
-func calculateCost(model string, inputTokens, outputTokens int) float64 {
-	var inputCost, outputCost float64
-	switch {
-	case strings.Contains(model, "opus"):
-		inputCost, outputCost = 0.000015, 0.000075
-	case strings.Contains(model, "sonnet"):
-		inputCost, outputCost = 0.000003, 0.000015
-	case strings.Contains(model, "haiku"):
-		inputCost, outputCost = 0.00000025, 0.00000125
-	default:
-		inputCost, outputCost = 0.000003, 0.000015
-	}
-	return float64(inputTokens)*inputCost + float64(outputTokens)*outputCost
+func calculateCost(model string, inputTokens, outputTokens, cacheReadTokens int) float64 {
+	const (
+		inputPricePerToken = 3.0 / 1_000_000       // 输入: 3元/百万
+		cachePricePerToken = 0.025 / 1_000_000      // 缓存读取: 0.025元/百万
+		outputPricePerToken = 6.0 / 1_000_000       // 输出: 6元/百万
+	)
+	return float64(inputTokens)*inputPricePerToken + float64(cacheReadTokens)*cachePricePerToken + float64(outputTokens)*outputPricePerToken
 }
 
 // ============================================================

@@ -419,7 +419,7 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	}
 
 	// 解析 token 统计
-	_, inputTokens, outputTokens := parseTokenStats(respBytes)
+	_, inputTokens, outputTokens, cacheReadTokens := parseTokenStats(respBytes)
 
 	// 设置响应头并返回
 	c.Header("Content-Type", "application/json")
@@ -427,7 +427,7 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 
 	// 记录统计
 	duration := time.Since(startTime).Milliseconds()
-	cost := calculateCost(modelName, inputTokens, outputTokens)
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
 
 	keyID, clientIP := GetAuthInfo(c)
 	if clientIP == "" {
@@ -435,7 +435,7 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	}
 
 	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "non-stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, 0, keyID, clientIP)
 
 	// 记录 history
 	history.AddRecord(history.RequestRecord{
@@ -455,9 +455,10 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 		ResponseHeaders: resp.Header,
 		RequestSize:     int64(len(requestBody)),
 		ResponseSize:    int64(len(respBytes)),
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		TotalTokens:     inputTokens + outputTokens,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:            cost,
 	})
 
@@ -526,7 +527,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	}
 
 	// 流式转发
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cacheReadTokens int
 	var responseBody strings.Builder
 	scanner := bufio.NewScanner(reader)
 	buf := scannerBufferPool.Get().([]byte)
@@ -554,7 +555,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 		}
 
 		// 提取 token 统计
-		inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
+		inputTokens, outputTokens, cacheReadTokens = extractTokensFromSSE(line, inputTokens, outputTokens, cacheReadTokens)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -567,7 +568,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	if firstTokenTime != nil && !firstTokenTime.IsZero() {
 		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
 	}
-	cost := calculateCost(modelName, inputTokens, outputTokens)
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
 
 	keyID, clientIP := GetAuthInfo(c)
 	if clientIP == "" {
@@ -575,7 +576,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	}
 
 	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, timeToFirst, keyID, clientIP)
 
 	// 记录 history
 	responseBodyStr := responseBody.String()
@@ -600,14 +601,15 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 		ResponseHeaders: resp.Header,
 		RequestSize:     int64(len(requestBody)),
 		ResponseSize:    int64(responseBody.Len()),
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		TotalTokens:     inputTokens + outputTokens,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:            cost,
 	})
 
-	logger.Info("✅ Anthropic stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms, TTFB=%dms",
-		modelName, inputTokens, outputTokens, duration, timeToFirst)
+	logger.Info("✅ Anthropic stream 完成: Model=%s, Tokens=%d+%d+%d(cache), Duration=%dms, TTFB=%dms",
+		modelName, inputTokens, outputTokens, cacheReadTokens, duration, timeToFirst)
 
 	return nil
 }

@@ -101,12 +101,16 @@
                     <div class="stat-value" id="totalOutput">0</div>
                 </div>
                 <div class="stat-card">
+                    <div class="stat-label">总缓存 Token</div>
+                    <div class="stat-value" id="totalCacheRead">0</div>
+                </div>
+                <div class="stat-card">
                     <div class="stat-label">总计 Token</div>
                     <div class="stat-value" id="totalTokens">0</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">总花费</div>
-                    <div class="stat-value" id="totalCost">$0.00</div>
+                    <div class="stat-value" id="totalCost">¥0.00</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">总请求数</div>
@@ -133,6 +137,7 @@
                         <th>类型</th>
                         <th>输入Token</th>
                         <th>输出Token</th>
+                        <th>缓存Token</th>
                         <th>总Token</th>
                         <th>花费</th>
                         <th>耗时</th>
@@ -231,6 +236,11 @@
                                 </div>
                                 <div class="token-divider"></div>
                                 <div class="token-item">
+                                    <div class="token-label">总缓存Token</div>
+                                    <div class="token-value">${formatToken(stat.cache_read_input_tokens || 0)}</div>
+                                </div>
+                                <div class="token-divider"></div>
+                                <div class="token-item">
                                     <div class="token-label">总Token</div>
                                     <div class="token-value">${formatToken(stat.total_tokens || 0)}</div>
                                 </div>
@@ -325,7 +335,7 @@
         }
 
         function formatCost(cost) {
-            return '$' + cost.toFixed(6);
+            return '¥' + cost.toFixed(6);
         }
 
         function formatToken(num) {
@@ -370,6 +380,7 @@
                         <td><span class="badge ${record.path && record.path.includes('/v1/chat') ? 'badge-stream' : 'badge-non-stream'}">${record.path && record.path.includes('/v1/chat') ? 'OpenAI' : 'Anthropic'}</span></td>
                         <td>${formatToken(record.input_tokens || 0)}</td>
                         <td>${formatToken(record.output_tokens || 0)}</td>
+                        <td>${formatToken(record.cache_read_input_tokens || 0)}</td>
                         <td>${formatToken(record.total_tokens || 0)}</td>
                         <td class="cost">${record.cost ? formatCost(record.cost) : '-'}</td>
                         <td>${formatDuration(record.duration_ms)}</td>
@@ -377,7 +388,7 @@
                     </tr>
                 `).join('');
             } else {
-                recordsTable.innerHTML = '<tr><td colspan="12" style="text-align: center; color: #999; padding: 20px;">暂无记录</td></tr>';
+                recordsTable.innerHTML = '<tr><td colspan="13" style="text-align: center; color: #999; padding: 20px;">暂无记录</td></tr>';
             }
         }
 
@@ -590,6 +601,7 @@
         function updateStats(data) {
             document.getElementById('totalInput').textContent = formatToken(data.total_input_tokens || 0);
             document.getElementById('totalOutput').textContent = formatToken(data.total_output_tokens || 0);
+            document.getElementById('totalCacheRead').textContent = formatToken(data.total_cache_read_tokens || 0);
             document.getElementById('totalTokens').textContent = formatToken(data.total_tokens || 0);
             document.getElementById('totalCost').textContent = formatCost(data.total_cost || 0);
             document.getElementById('totalRequestCount').textContent = (data.total_request_count || 0).toLocaleString();
@@ -611,6 +623,10 @@
                             <div class="provider-stat-item">
                                 <div class="provider-stat-label">输出Token</div>
                                 <div class="provider-stat-value">${formatToken(provider.output_tokens)}</div>
+                            </div>
+                            <div class="provider-stat-item">
+                                <div class="provider-stat-label">缓存Token</div>
+                                <div class="provider-stat-value">${formatToken(provider.cache_read_input_tokens || 0)}</div>
                             </div>
                             <div class="provider-stat-item">
                                 <div class="provider-stat-label">总Token</div>
@@ -636,7 +652,7 @@
             if (data.recent_records && data.recent_records.length > 0) {
                 // Don't update table here, use loadHistory instead
             } else {
-                recordsTable.innerHTML = '<tr><td colspan="12" style="text-align: center; color: #999; padding: 20px;">暂无记录</td></tr>';
+                recordsTable.innerHTML = '<tr><td colspan="13" style="text-align: center; color: #999; padding: 20px;">暂无记录</td></tr>';
             }
         }
 
@@ -722,6 +738,7 @@
                 <td><span class="badge ${record.path && record.path.includes('/v1/chat') ? 'badge-stream' : 'badge-non-stream'}">${record.path && record.path.includes('/v1/chat') ? 'OpenAI' : 'Anthropic'}</span></td>
                 <td>${formatToken(record.input_tokens || 0)}</td>
                 <td>${formatToken(record.output_tokens || 0)}</td>
+                <td>${formatToken(record.cache_read_input_tokens || 0)}</td>
                 <td>${formatToken(record.total_tokens || 0)}</td>
                 <td class="cost">${record.cost ? formatCost(record.cost) : '-'}</td>
                 <td>${formatDuration(record.duration_ms)}</td>

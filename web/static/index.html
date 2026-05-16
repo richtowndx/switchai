@@ -171,12 +171,16 @@
                     <div class="stat-value" id="totalOutput">0</div>
                 </div>
                 <div class="stat-item">
+                    <div class="stat-label">总缓存 Token</div>
+                    <div class="stat-value" id="totalCacheRead">0</div>
+                </div>
+                <div class="stat-item">
                     <div class="stat-label">总计 Token</div>
                     <div class="stat-value" id="totalTokens">0</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">总花费</div>
-                    <div class="stat-value" id="totalCost">$0.00</div>
+                    <div class="stat-value" id="totalCost">¥0.00</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">总请求数</div>
@@ -197,12 +201,16 @@
                     <div class="stat-value" id="todayOutput">0</div>
                 </div>
                 <div class="stat-item">
+                    <div class="stat-label">今日缓存 Token</div>
+                    <div class="stat-value" id="todayCacheRead">0</div>
+                </div>
+                <div class="stat-item">
                     <div class="stat-label">今日总计 Token</div>
                     <div class="stat-value" id="todayTokens">0</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">今日花费</div>
-                    <div class="stat-value" id="todayCost">$0.00</div>
+                    <div class="stat-value" id="todayCost">¥0.00</div>
                 </div>
                 <div class="stat-item">
                     <div class="stat-label">今日请求数</div>
@@ -455,11 +463,11 @@
                             <input type="number" name="total_req_limit" id="editKeyTotalReqLimit" placeholder="0=不限" min="0">
                         </div>
                         <div class="form-group">
-                            <label>每日花费限额 ($)</label>
+                            <label>每日花费限额 (¥)</label>
                             <input type="number" name="daily_cost_limit" id="editKeyDailyCostLimit" placeholder="0=不限" min="0" step="0.01">
                         </div>
                         <div class="form-group">
-                            <label>总花费限额 ($)</label>
+                            <label>总花费限额 (¥)</label>
                             <input type="number" name="total_cost_limit" id="editKeyTotalCostLimit" placeholder="0=不限" min="0" step="0.01">
                         </div>
                     </div>
@@ -781,8 +789,8 @@
             list.innerHTML = serverKeys.map((k, index) => {
                 const stat = keyStats[k.id] || { input_tokens: 0, output_tokens: 0, total_tokens: 0, total_cost: 0, request_count: 0, today_req_count: 0, today_cost: 0, ip_addresses: [] };
                 const ips = stat.ip_addresses ? stat.ip_addresses.join(', ') : '无';
-                const costDisplay = stat.total_cost > 0 ? '$' + stat.total_cost.toFixed(4) : '$0';
-                const todayCostDisplay = stat.today_cost > 0 ? '$' + stat.today_cost.toFixed(4) : '$0';
+                const costDisplay = stat.total_cost > 0 ? '¥' + stat.total_cost.toFixed(4) : '¥0';
+                const todayCostDisplay = stat.today_cost > 0 ? '¥' + stat.today_cost.toFixed(4) : '¥0';
 
                 // 构建限额显示
                 const limits = [];
@@ -793,10 +801,10 @@
                     limits.push(`<span style="color: #ed8936;">总请求 ${stat.request_count || 0}/${k.total_req_limit}</span>`);
                 }
                 if (k.daily_cost_limit > 0) {
-                    limits.push(`<span style="color: #ed8936;">日花费 ${todayCostDisplay}/$${k.daily_cost_limit.toFixed(2)}</span>`);
+                    limits.push(`<span style="color: #ed8936;">日花费 ${todayCostDisplay}/¥${k.daily_cost_limit.toFixed(2)}</span>`);
                 }
                 if (k.total_cost_limit > 0) {
-                    limits.push(`<span style="color: #ed8936;">总花费 ${costDisplay}/$${k.total_cost_limit.toFixed(2)}</span>`);
+                    limits.push(`<span style="color: #ed8936;">总花费 ${costDisplay}/¥${k.total_cost_limit.toFixed(2)}</span>`);
                 }
 
                 return `
@@ -988,8 +996,9 @@
         function updateStats(data) {
             document.getElementById('totalInput').textContent = formatToken(data.total_input_tokens || 0);
             document.getElementById('totalOutput').textContent = formatToken(data.total_output_tokens || 0);
+            document.getElementById('totalCacheRead').textContent = formatToken(data.total_cache_read_tokens || 0);
             document.getElementById('totalTokens').textContent = formatToken(data.total_tokens || 0);
-            document.getElementById('totalCost').textContent = '$' + (data.total_cost || 0).toFixed(4);
+            document.getElementById('totalCost').textContent = '¥' + (data.total_cost || 0).toFixed(4);
             document.getElementById('totalRequestCount').textContent = (data.total_request_count || 0).toLocaleString();
         }
 
@@ -1005,8 +1014,9 @@
         function updateTodayStats(data) {
             document.getElementById('todayInput').textContent = formatToken(data.total_input_tokens || 0);
             document.getElementById('todayOutput').textContent = formatToken(data.total_output_tokens || 0);
+            document.getElementById('todayCacheRead').textContent = formatToken(data.total_cache_read_tokens || 0);
             document.getElementById('todayTokens').textContent = formatToken(data.total_tokens || 0);
-            document.getElementById('todayCost').textContent = '$' + (data.total_cost || 0).toFixed(4);
+            document.getElementById('todayCost').textContent = '¥' + (data.total_cost || 0).toFixed(4);
             document.getElementById('todayRequestCount').textContent = (data.total_request_count || 0).toLocaleString();
         }
 
@@ -1019,7 +1029,7 @@
                     <div class="history-date">${day.date === today ? '今日' : day.date}</div>
                     <div class="history-value">${formatToken(day.total_tokens)}</div>
                     <div class="history-label">Token</div>
-                    <div class="history-value" style="font-size: 14px; color: #38ef7d;">$${day.total_cost.toFixed(4)}</div>
+                    <div class="history-value" style="font-size: 14px; color: #38ef7d;">¥${day.total_cost.toFixed(4)}</div>
                     <div class="history-label">花费 · ${day.request_count} 请求</div>
                 </div>
             `).join('');

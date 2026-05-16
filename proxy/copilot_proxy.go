@@ -416,7 +416,7 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 	}
 
 	// 解析 token 统计
-	_, inputTokens, outputTokens := parseTokenStats(anthropicResp)
+	_, inputTokens, outputTokens, cacheReadTokens := parseTokenStats(anthropicResp)
 
 	// 设置响应头并返回
 	c.Header("Content-Type", "application/json")
@@ -424,7 +424,7 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 
 	// 记录统计
 	duration := time.Since(startTime).Milliseconds()
-	cost := calculateCost(modelName, inputTokens, outputTokens)
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
 
 	keyID, clientIP := GetAuthInfo(c)
 	if clientIP == "" {
@@ -432,7 +432,7 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 	}
 
 	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "non-stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, 0, keyID, clientIP)
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, 0, keyID, clientIP)
 
 	// 记录 history（记录转换后的响应）
 	history.AddRecord(history.RequestRecord{
@@ -452,9 +452,10 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 		ResponseHeaders: resp.Header,
 		RequestSize:  int64(len(requestBody)),
 		ResponseSize: int64(len(anthropicResp)),
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  inputTokens + outputTokens,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:         cost,
 	})
 
@@ -525,7 +526,7 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 	}
 
 	// 流式转发 + 格式转换
-	var inputTokens, outputTokens int
+	var inputTokens, outputTokens, cacheReadTokens int
 	scanner := bufio.NewScanner(reader)
 	buf := scannerBufferPool.Get().([]byte)
 	defer func() { scannerBufferPool.Put(buf) }()
@@ -543,7 +544,7 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 		flusher.Flush()
 
 		// 提取 token 统计（使用原始行）
-		inputTokens, outputTokens = extractTokensFromSSE(line, inputTokens, outputTokens)
+		inputTokens, outputTokens, cacheReadTokens = extractTokensFromSSE(line, inputTokens, outputTokens, cacheReadTokens)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -556,7 +557,7 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 	if !firstTokenTime.IsZero() {
 		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
 	}
-	cost := calculateCost(modelName, inputTokens, outputTokens)
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
 
 	keyID, clientIP := GetAuthInfo(c)
 	if clientIP == "" {
@@ -564,7 +565,7 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 	}
 
 	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "stream", "ccproxy",
-		inputTokens, outputTokens, cost, duration, timeToFirst, keyID, clientIP)
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, timeToFirst, keyID, clientIP)
 
 	// 记录 history（记录转换后的响应）
 	// 注意：这里没有收集完整的流式响应体，因为转换后的响应大小可能很大
@@ -585,9 +586,10 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 		ResponseHeaders: nil, // 流式响应头已经在上面设置过了
 		RequestSize:  int64(len(requestBody)),
 		ResponseSize: 0,
-		InputTokens:  inputTokens,
-		OutputTokens: outputTokens,
-		TotalTokens:  inputTokens + outputTokens,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:         cost,
 	})
 

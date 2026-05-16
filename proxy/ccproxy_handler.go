@@ -159,79 +159,94 @@ func GetAuthInfo(c *gin.Context) (keyID, clientIP string) {
 }
 
 // parseTokenStats 从响应体中解析 token 统计（不再解析 model）
-func parseTokenStats(respBody []byte) (string, int, int) {
+func parseTokenStats(respBody []byte) (string, int, int, int) {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return "", 0, 0
+		return "", 0, 0, 0
 	}
 
-	inputTokens, outputTokens := 0, 0
+	inputTokens, outputTokens, cacheReadTokens := 0, 0, 0
 
-	// 尝试 OpenAI 格式
+	// 从 usage 对象中提取所有 token 字段
+	// 同时支持 OpenAI 格式 (prompt_tokens/completion_tokens) 和 Anthropic 格式 (input_tokens/output_tokens)
 	if usage, ok := resp["usage"].(map[string]interface{}); ok {
-		if pt, ok := usage["prompt_tokens"].(float64); ok {
-			inputTokens = int(pt)
-		}
-		if ct, ok := usage["completion_tokens"].(float64); ok {
-			outputTokens = int(ct)
-		}
-	}
-
-	// 尝试 Anthropic 格式
-	if inputTokens == 0 && outputTokens == 0 {
-		if usage, ok := resp["usage"].(map[string]interface{}); ok {
-			if it, ok := usage["input_tokens"].(float64); ok {
-				inputTokens = int(it)
-			}
-			if ot, ok := usage["output_tokens"].(float64); ok {
-				outputTokens = int(ot)
-			}
-		}
-	}
-
-	return "", inputTokens, outputTokens
-}
-
-// parseUsageFromJSON 从 JSON 字符串中解析 usage（OpenAI 或 Anthropic 格式）
-func parseUsageFromJSON(data string, inputTokens, outputTokens int) (int, int) {
-	var event map[string]interface{}
-	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return inputTokens, outputTokens
-	}
-
-	// OpenAI 格式
-	if usage, ok := event["usage"].(map[string]interface{}); ok {
+		// OpenAI 格式
 		if pt, ok := usage["prompt_tokens"].(float64); ok && pt > 0 {
 			inputTokens = int(pt)
 		}
 		if ct, ok := usage["completion_tokens"].(float64); ok && ct > 0 {
 			outputTokens = int(ct)
 		}
-		return inputTokens, outputTokens
-	}
-
-	// Anthropic 格式
-	if usage, ok := event["usage"].(map[string]interface{}); ok {
+		// Anthropic 格式（优先级更高，会覆盖 OpenAI 格式的值）
 		if it, ok := usage["input_tokens"].(float64); ok && it > 0 {
 			inputTokens = int(it)
 		}
 		if ot, ok := usage["output_tokens"].(float64); ok && ot > 0 {
 			outputTokens = int(ot)
 		}
+		// cache_read_input_tokens（两种格式通用）
+		if crt, ok := usage["cache_read_input_tokens"].(float64); ok && crt > 0 {
+			cacheReadTokens = int(crt)
+		}
+		// OpenAI 格式的 prompt_tokens_details.cached_tokens
+		if ptd, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+			if ct, ok := ptd["cached_tokens"].(float64); ok && ct > 0 && cacheReadTokens == 0 {
+				cacheReadTokens = int(ct)
+			}
+		}
 	}
 
-	return inputTokens, outputTokens
+	return "", inputTokens, outputTokens, cacheReadTokens
+}
+
+// parseUsageFromJSON 从 JSON 字符串中解析 usage（OpenAI 或 Anthropic 格式）
+func parseUsageFromJSON(data string, inputTokens, outputTokens, cacheReadTokens int) (int, int, int) {
+	var event map[string]interface{}
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return inputTokens, outputTokens, cacheReadTokens
+	}
+
+	// 从 usage 对象中提取所有 token 字段
+	// 同时支持 OpenAI 格式 (prompt_tokens/completion_tokens) 和 Anthropic 格式 (input_tokens/output_tokens)
+	if usage, ok := event["usage"].(map[string]interface{}); ok {
+		// OpenAI 格式
+		if pt, ok := usage["prompt_tokens"].(float64); ok && pt > 0 {
+			inputTokens = int(pt)
+		}
+		if ct, ok := usage["completion_tokens"].(float64); ok && ct > 0 {
+			outputTokens = int(ct)
+		}
+		// Anthropic 格式（优先级更高，会覆盖 OpenAI 格式的值）
+		if it, ok := usage["input_tokens"].(float64); ok && it > 0 {
+			inputTokens = int(it)
+		}
+		if ot, ok := usage["output_tokens"].(float64); ok && ot > 0 {
+			outputTokens = int(ot)
+		}
+		// cache_read_input_tokens（两种格式通用）
+		if crt, ok := usage["cache_read_input_tokens"].(float64); ok && crt > 0 {
+			cacheReadTokens = int(crt)
+		}
+		// OpenAI 格式的 prompt_tokens_details.cached_tokens
+		if ptd, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+			if ct, ok := ptd["cached_tokens"].(float64); ok && ct > 0 && cacheReadTokens == 0 {
+				cacheReadTokens = int(ct)
+			}
+		}
+	}
+
+	return inputTokens, outputTokens, cacheReadTokens
 }
 
 // extractTokensFromSSE 从 SSE 行中提取 token 统计
 // 优化 1: 区分 Anthropic SSE 事件类型（message_start 只取 input_tokens，message_delta 只取 output_tokens）
 // 优化 2: 处理非标准情况（上游在流式请求中直接返回非流式 JSON）
-func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int) {
+func extractTokensFromSSE(line string, inputTokens, outputTokens, cacheReadTokens int) (int, int, int) {
 	line = strings.TrimSpace(line)
 
 	// 检查是否为空行
 	if line == "" {
-		return inputTokens, outputTokens
+		return inputTokens, outputTokens, cacheReadTokens
 	}
 
 	// 1. 标准 SSE 格式
@@ -243,13 +258,13 @@ func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int)
 		data = strings.TrimPrefix(line, "data: ")
 		isSSE = true
 		if data == "[DONE]" {
-			return inputTokens, outputTokens
+			return inputTokens, outputTokens, cacheReadTokens
 		}
 	} else if strings.HasPrefix(line, "data:") {
 		data = strings.TrimPrefix(line, "data:")
 		isSSE = true
 		if data == "[DONE]" {
-			return inputTokens, outputTokens
+			return inputTokens, outputTokens, cacheReadTokens
 		}
 	} else {
 		// 2. 非标准情况：上游在流式请求中直接返回非流式 JSON
@@ -258,43 +273,37 @@ func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int)
 			data = line
 			isSSE = false
 		} else {
-			return inputTokens, outputTokens
+			return inputTokens, outputTokens, cacheReadTokens
 		}
 	}
 
 	var event map[string]interface{}
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return inputTokens, outputTokens
+		return inputTokens, outputTokens, cacheReadTokens
 	}
 
 	// 优化: 区分 Anthropic SSE 事件类型，精确捕获
 	if isSSE {
 		if eventType, ok := event["type"].(string); ok {
 			switch eventType {
-			case "message_start":
-				// 只捕获 input_tokens（最终值），此时 output_tokens=0 是占位，不应记录
-				// Anthropic 格式: event.message.usage.input_tokens
-				if message, ok := event["message"].(map[string]interface{}); ok {
-					if usage, ok := message["usage"].(map[string]interface{}); ok {
+				case "message_start":
+					// 不提取 token，所有 token 数据由 message_delta 提供
+					return inputTokens, outputTokens, cacheReadTokens
+
+				case "message_delta":
+					// message_delta 的 input_tokens 是非缓存输入，output_tokens 和 cache_read_input_tokens 是累计值
+					if usage, ok := event["usage"].(map[string]interface{}); ok {
 						if it, ok := usage["input_tokens"].(float64); ok {
 							inputTokens = int(it)
 						}
-						// cache tokens 也从这里获取
-						if cacheRead, ok := usage["cache_read_input_tokens"].(float64); ok && cacheRead > 0 {
-							// 可选：记录 cache_read_tokens
+						if ot, ok := usage["output_tokens"].(float64); ok {
+							outputTokens = int(ot)
+						}
+						if crt, ok := usage["cache_read_input_tokens"].(float64); ok {
+							cacheReadTokens = int(crt)
 						}
 					}
-				}
-				return inputTokens, outputTokens
-
-			case "message_delta":
-				// 只捕获 output_tokens（最终值）
-				if usage, ok := event["usage"].(map[string]interface{}); ok {
-					if ot, ok := usage["output_tokens"].(float64); ok {
-						outputTokens = int(ot)
-					}
-				}
-				return inputTokens, outputTokens
+					return inputTokens, outputTokens, cacheReadTokens
 			}
 		}
 	}
@@ -321,7 +330,16 @@ func extractTokensFromSSE(line string, inputTokens, outputTokens int) (int, int)
 				outputTokens = int(ot)
 			}
 		}
+		// cache tokens
+		if crt, ok := usage["cache_read_input_tokens"].(float64); ok && crt > 0 {
+			cacheReadTokens = int(crt)
+		}
+		if ptd, ok := usage["prompt_tokens_details"].(map[string]interface{}); ok {
+			if ct, ok := ptd["cached_tokens"].(float64); ok && ct > 0 && cacheReadTokens == 0 {
+				cacheReadTokens = int(ct)
+			}
+		}
 	}
 
-	return inputTokens, outputTokens
+	return inputTokens, outputTokens, cacheReadTokens
 }
