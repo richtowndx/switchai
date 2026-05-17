@@ -254,6 +254,9 @@ func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody []b
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+	req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
+	req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+	req.Header.Set("x-app", "cli")
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := p.client.Do(req)
@@ -292,7 +295,11 @@ func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqHdr http.He
 		// 设置必要的请求头
 		for k, v := range reqHdr {
 			for _, val := range v {
-				if strings.ToLower(k) == "authorization" || strings.ToLower(k) == "content-type" {
+				if strings.ToLower(k) == "authorization" ||
+					strings.ToLower(k) == "content-type" ||
+					strings.ToLower(k) == "user-agent" ||
+					strings.ToLower(k) == "anthropic-beta" ||
+					strings.ToLower(k) == "x-app" {
 					continue
 				}
 				req.Header.Add(k, val)
@@ -300,6 +307,9 @@ func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqHdr http.He
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+		req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
+		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+		req.Header.Set("x-app", "cli")
 
 		resp, err := p.client.Do(req)
 		if err != nil {
@@ -402,7 +412,10 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
-
+	req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
+	req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+	req.Header.Set("x-app", "cli")
+	req.Header.Set("anthropic-version", "2023-06-01")
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("send request: %w", err)
@@ -439,27 +452,27 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 
 	// 记录 history
 	history.AddRecord(history.RequestRecord{
-		ID:              requestID,
-		Timestamp:       startTime,
-		Method:          method,
-		Path:            path,
-		ClientIP:        clientIP,
-		KeyID:           keyID,
-		Provider:        p.provider.Name,
-		Model:           modelName,
-		StatusCode:      resp.StatusCode,
-		Duration:        duration,
-		RequestBody:     requestBody,
-		ResponseBody:    string(respBytes),
-		RequestHeaders:  c.Request.Header,
-		ResponseHeaders: resp.Header,
-		RequestSize:     int64(len(requestBody)),
-		ResponseSize:    int64(len(respBytes)),
+		ID:                   requestID,
+		Timestamp:            startTime,
+		Method:               method,
+		Path:                 path,
+		ClientIP:             clientIP,
+		KeyID:                keyID,
+		Provider:             p.provider.Name,
+		Model:                modelName,
+		StatusCode:           resp.StatusCode,
+		Duration:             duration,
+		RequestBody:          requestBody,
+		ResponseBody:         string(respBytes),
+		RequestHeaders:       c.Request.Header,
+		ResponseHeaders:      resp.Header,
+		RequestSize:          int64(len(requestBody)),
+		ResponseSize:         int64(len(respBytes)),
 		InputTokens:          inputTokens,
 		OutputTokens:         outputTokens,
 		CacheReadInputTokens: cacheReadTokens,
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
-		Cost:            cost,
+		Cost:                 cost,
 	})
 
 	logger.Info("✅ Anthropic non-stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms", modelName, inputTokens, outputTokens, duration)
@@ -478,11 +491,18 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	// 设置必要的请求头
 	for k, v := range reqHdr {
 		for _, val := range v {
-			if strings.ToLower(k) == "authorization" || strings.ToLower(k) == "content-type" {
+			if strings.ToLower(k) == "authorization" ||
+				strings.ToLower(k) == "content-type" ||
+				strings.ToLower(k) == "user-agent" ||
+				strings.ToLower(k) == "anthropic-beta" ||
+				strings.ToLower(k) == "x-app" {
 				continue
 			}
 			req.Header.Add(k, val)
 		}
+		req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
+		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+		req.Header.Set("x-app", "cli")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
@@ -585,27 +605,27 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	}
 
 	history.AddRecord(history.RequestRecord{
-		ID:              requestID,
-		Timestamp:       startTime,
-		Method:          method,
-		Path:            path,
-		ClientIP:        clientIP,
-		KeyID:           keyID,
-		Provider:        p.provider.Name,
-		Model:           modelName,
-		StatusCode:      resp.StatusCode,
-		Duration:        duration,
-		RequestBody:     requestBody,
-		ResponseBody:    responseBodyStr,
-		RequestHeaders:  c.Request.Header,
-		ResponseHeaders: resp.Header,
-		RequestSize:     int64(len(requestBody)),
-		ResponseSize:    int64(responseBody.Len()),
+		ID:                   requestID,
+		Timestamp:            startTime,
+		Method:               method,
+		Path:                 path,
+		ClientIP:             clientIP,
+		KeyID:                keyID,
+		Provider:             p.provider.Name,
+		Model:                modelName,
+		StatusCode:           resp.StatusCode,
+		Duration:             duration,
+		RequestBody:          requestBody,
+		ResponseBody:         responseBodyStr,
+		RequestHeaders:       c.Request.Header,
+		ResponseHeaders:      resp.Header,
+		RequestSize:          int64(len(requestBody)),
+		ResponseSize:         int64(responseBody.Len()),
 		InputTokens:          inputTokens,
 		OutputTokens:         outputTokens,
 		CacheReadInputTokens: cacheReadTokens,
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
-		Cost:            cost,
+		Cost:                 cost,
 	})
 
 	logger.Info("✅ Anthropic stream 完成: Model=%s, Tokens=%d+%d+%d(cache), Duration=%dms, TTFB=%dms",
