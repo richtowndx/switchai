@@ -165,9 +165,6 @@ func (t *ConnectionTracker) OnAccept(conn net.Conn, protocol string, isTLS bool)
 	t.connections.Store(connID, info)
 	t.activeConns.Add(1)
 
-	logger.Info("[ACCEPT] %s from %s (proto: %s, tls: %v, provider: %s, hash: %d)",
-		connID, info.RemoteAddr, protocol, isTLS, getProviderName(provider), clientHash)
-
 	return info
 }
 

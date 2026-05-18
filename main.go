@@ -153,20 +153,6 @@ func startServer(port string) {
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: r,
-		// 设置连接状态回调以更好地跟踪连接
-		ConnState: func(conn net.Conn, state http.ConnState) {
-			// 可以在这里添加连接状态变化跟踪
-			switch state {
-			case http.StateNew:
-				logger.Info("[CONN] New connection detected")
-			case http.StateActive:
-				logger.Info("[CONN] Connection became active")
-			case http.StateIdle:
-				logger.Info("[CONN] Connection idle")
-			case http.StateClosed:
-				logger.Info("[CONN] Connection closed")
-			}
-		},
 	}
 
 	// 启动服务器

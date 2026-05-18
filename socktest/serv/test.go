@@ -106,9 +106,6 @@ func (t *ConnectionTracker) OnAccept(conn net.Conn, protocol string, isTLS bool)
 	t.connections.Store(connID, info)
 	t.activeConns.Add(1)
 
-	fmt.Printf("[ACCEPT] %s from %s (proto: %s, tls: %v)\n",
-		connID, info.RemoteAddr, protocol, isTLS)
-
 	return info
 }
 
@@ -143,7 +140,6 @@ type TrackedConn struct {
 	net.Conn
 	tracker *ConnectionTracker
 	info    *ConnectionInfo
-	
 }
 
 func (c *TrackedConn) Read(b []byte) (int, error) {

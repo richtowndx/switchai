@@ -59,9 +59,6 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 		return
 	}
 
-	logger.Info("Incoming request: ID=%s, Method=%s, Path=%s, Format=%s, RemoteAddr=%s",
-		requestID, c.Request.Method, c.Request.URL.Path, cfg.formatName, c.Request.RemoteAddr)
-
 	// 2. 获取或创建连接级别的 CcProxy entry
 	mgr := GetGlobalConnProxyManager()
 	entry, err := mgr.GetOrCreate(c.Request.RemoteAddr, nil)
@@ -70,9 +67,6 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Failed to initialize proxy"})
 		return
 	}
-
-	logger.Info("📡 使用 CcProxy: %s (format: isOpenAI=%v, isCopilot=%v, requests: %d)",
-		entry.Provider.Name, entry.Provider.IsOpenAIFormat, entry.Provider.IsCopilot(), entry.RequestCount)
 
 	// 3. 读取原始请求体（不做任何修改）
 	bodyBytes, err := io.ReadAll(c.Request.Body)
@@ -92,16 +86,13 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 	ctx := context.Background()
 	if cfg.isIncomingOpenAIFormat {
 		if err := entry.Proxy.HandleOpenAIFormat(ctx, c, c.Request.Header, bodyBytes); err != nil {
-			logger.Error("❌ HandleOpenAIFormat failed: %v", err)
 			if shouldSwitchProvider(err) {
 				logger.Error("[ConnProxyManager] 切换 provider (错误 %d) 并重试: %s -> %s", getStatusCodeFromError(err), c.Request.RemoteAddr, entry.Provider.Name)
 				newEntry, switchErr := mgr.SwitchProvider(c.Request.RemoteAddr, entry.providerIdx+1)
 				if switchErr == nil {
-					logger.Info("📡 切换到新 CcProxy: %s", newEntry.Provider.Name)
 					if retryErr := newEntry.Proxy.HandleOpenAIFormat(ctx, c, c.Request.Header, bodyBytes); retryErr == nil {
 						return
 					} else {
-						logger.Error("❌ 重试 HandleOpenAIFormat 仍失败 (provider=%s): %v", newEntry.Provider.Name, retryErr)
 						if shouldSwitchProvider(retryErr) {
 							mgr.Remove(c.Request.RemoteAddr)
 						}
@@ -113,17 +104,14 @@ func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
 			c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
 		}
 	} else {
+
 		if err := entry.Proxy.HandleAnthropicFormat(ctx, c, c.Request.Header, bodyBytes); err != nil {
-			logger.Error("❌ HandleAnthropicFormat failed: %v", err)
 			if shouldSwitchProvider(err) {
-				logger.Error("[ConnProxyManager] 切换 provider (错误 %d) 并重试: %s -> %s", getStatusCodeFromError(err), c.Request.RemoteAddr, entry.Provider.Name)
 				newEntry, switchErr := mgr.SwitchProvider(c.Request.RemoteAddr, entry.providerIdx+1)
 				if switchErr == nil {
-					logger.Info("📡 切换到新 CcProxy: %s", newEntry.Provider.Name)
 					if retryErr := newEntry.Proxy.HandleAnthropicFormat(ctx, c, c.Request.Header, bodyBytes); retryErr == nil {
 						return
 					} else {
-						logger.Error("❌ 重试 HandleAnthropicFormat 仍失败 (provider=%s): %v", newEntry.Provider.Name, retryErr)
 						if shouldSwitchProvider(retryErr) {
 							mgr.Remove(c.Request.RemoteAddr)
 						}
@@ -286,24 +274,24 @@ func extractTokensFromSSE(line string, inputTokens, outputTokens, cacheReadToken
 	if isSSE {
 		if eventType, ok := event["type"].(string); ok {
 			switch eventType {
-				case "message_start":
-					// 不提取 token，所有 token 数据由 message_delta 提供
-					return inputTokens, outputTokens, cacheReadTokens
+			case "message_start":
+				// 不提取 token，所有 token 数据由 message_delta 提供
+				return inputTokens, outputTokens, cacheReadTokens
 
-				case "message_delta":
-					// message_delta 的 input_tokens 是非缓存输入，output_tokens 和 cache_read_input_tokens 是累计值
-					if usage, ok := event["usage"].(map[string]interface{}); ok {
-						if it, ok := usage["input_tokens"].(float64); ok {
-							inputTokens = int(it)
-						}
-						if ot, ok := usage["output_tokens"].(float64); ok {
-							outputTokens = int(ot)
-						}
-						if crt, ok := usage["cache_read_input_tokens"].(float64); ok {
-							cacheReadTokens = int(crt)
-						}
+			case "message_delta":
+				// message_delta 的 input_tokens 是非缓存输入，output_tokens 和 cache_read_input_tokens 是累计值
+				if usage, ok := event["usage"].(map[string]interface{}); ok {
+					if it, ok := usage["input_tokens"].(float64); ok {
+						inputTokens = int(it)
 					}
-					return inputTokens, outputTokens, cacheReadTokens
+					if ot, ok := usage["output_tokens"].(float64); ok {
+						outputTokens = int(ot)
+					}
+					if crt, ok := usage["cache_read_input_tokens"].(float64); ok {
+						cacheReadTokens = int(crt)
+					}
+				}
+				return inputTokens, outputTokens, cacheReadTokens
 			}
 		}
 	}

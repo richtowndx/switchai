@@ -103,8 +103,6 @@ func (p *AnthropicProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Conte
 	// 1. 一次性解析并处理：模型映射 + stream 检查
 	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
 
-	logger.Info("[AnthropicProxy] Handling %s Anthropic request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
-
 	if isStream {
 		return p.handleAnthropicStreamingResponse(ctx, c, reqHdr, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
 	}
@@ -132,8 +130,6 @@ func (p *AnthropicProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context,
 
 	// 2. 转换并处理：OpenAI → Anthropic + 模型映射 + stream 检查
 	modifiedBody, modelName, isStream := p.convertAndProcessOpenAIRequest(reqBody)
-
-	logger.Info("[AnthropicProxy] Handling %s OpenAI request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
 
 	if isStream {
 		return p.handleAnthropicStreamingResponse(ctx, c, reqHdr, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
@@ -407,7 +403,7 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -418,17 +414,17 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	req.Header.Set("anthropic-version", "2023-06-01")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request: %w", err)
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := readResponseBody(resp)
 	if err != nil {
-		return err
+		return fmt.Errorf("read body | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))
+		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))
 	}
 
 	// 解析 token 统计
@@ -474,9 +470,6 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:                 cost,
 	})
-
-	logger.Info("✅ Anthropic non-stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms", modelName, inputTokens, outputTokens, duration)
-
 	return nil
 }
 
@@ -485,7 +478,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	// 设置必要的请求头
@@ -510,13 +503,13 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request: %w", err)
+		return fmt.Errorf("send request: %w; %s:%s", err, modelName, p.provider.Name)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body))
 	}
 
 	// 设置流式响应头
@@ -526,7 +519,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("streaming not supported")
+		return fmt.Errorf("streaming not supported | model:%s provider:%s", modelName, p.provider.Name)
 	}
 
 	// 处理 Content-Encoding: gzip/brotli
@@ -579,7 +572,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan stream: %w", err)
+		return fmt.Errorf("scan stream | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	// 记录统计
@@ -627,9 +620,5 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:                 cost,
 	})
-
-	logger.Info("✅ Anthropic stream 完成: Model=%s, Tokens=%d+%d+%d(cache), Duration=%dms, TTFB=%dms",
-		modelName, inputTokens, outputTokens, cacheReadTokens, duration, timeToFirst)
-
 	return nil
 }

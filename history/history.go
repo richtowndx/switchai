@@ -41,22 +41,31 @@ type RequestRecord struct {
 	Cost                 float64     `json:"cost"`
 }
 
+// recordWrite 用于异步写入的记录结构
+type recordWrite struct {
+	record            RequestRecord
+	reqHeadersString  string
+	respHeadersString string
+}
+
 var (
-	db          *sql.DB
-	history     *History
-	broadcast   chan RequestRecord
-	clients     map[*websocket.Conn]bool
-	clientsMu   sync.RWMutex
+	db        *sql.DB
+	history   *History
+	broadcast chan RequestRecord
+	clients   map[*websocket.Conn]bool
+	clientsMu sync.RWMutex
 
 	// 首页缓存
 	homeCache      []RequestRecord
 	homeCacheMu    sync.RWMutex
-	homeCacheSize = 20 // 首页缓存大小
-	homeCacheTotal int // 缓存时的总记录数
+	homeCacheSize  = 20 // 首页缓存大小
+	homeCacheTotal int  // 缓存时的总记录数
 )
 
 type History struct {
-	quitChan chan struct{}
+	quitChan   chan struct{}
+	writeChan  chan recordWrite
+	shutdownWg sync.WaitGroup
 }
 
 func Init() error {
@@ -73,6 +82,10 @@ func Init() error {
 		return err
 	}
 
+	// 设置 SQLite 连接参数，提高并发性能
+	db.SetMaxOpenConns(1) // SQLite 只能有一个写入连接
+	db.SetMaxIdleConns(1)
+
 	// Create table and index
 	if err := initDB(); err != nil {
 		db.Close()
@@ -80,7 +93,8 @@ func Init() error {
 	}
 
 	history = &History{
-		quitChan: make(chan struct{}),
+		quitChan:  make(chan struct{}),
+		writeChan: make(chan recordWrite, 512), // 缓冲512条记录
 	}
 	broadcast = make(chan RequestRecord, 1000)
 	clients = make(map[*websocket.Conn]bool)
@@ -91,10 +105,62 @@ func Init() error {
 	// Start broadcast goroutine
 	go history.handleBroadcast()
 
+	// 启动异步写入 goroutine
+	go history.handleDBWrite()
+
 	// 启动定时清理 goroutine（每6小时清理一次）
 	go history.periodicCleanup()
 
 	return nil
+}
+
+// handleDBWrite 异步处理数据库写入
+func (h *History) handleDBWrite() {
+	h.shutdownWg.Add(1)
+	defer h.shutdownWg.Done()
+
+	logger.Info("🔄 History async DB writer started")
+
+	for {
+		select {
+		case <-h.quitChan:
+			// 处理剩余记录
+			for len(h.writeChan) > 0 {
+				writeRec := <-h.writeChan
+				h.writeToDB(writeRec)
+			}
+			logger.Info("🛑 History async DB writer stopped")
+			return
+
+		case writeRec := <-h.writeChan:
+			h.writeToDB(writeRec)
+		}
+	}
+}
+
+// writeToDB 实际执行数据库写入（在专用 goroutine 中调用）
+func (h *History) writeToDB(writeRec recordWrite) {
+	_, err := db.Exec(`
+		INSERT INTO history (id, timestamp, method, path, client_ip, key_id, provider, model,
+			status_code, duration_ms, request_body, response_body, request_headers, response_headers,
+			request_size, response_size, input_tokens, output_tokens, cache_read_input_tokens, total_tokens, cost)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		writeRec.record.ID, writeRec.record.Timestamp.UnixNano(), writeRec.record.Method, writeRec.record.Path, writeRec.record.ClientIP,
+		writeRec.record.KeyID, writeRec.record.Provider, writeRec.record.Model, writeRec.record.StatusCode, writeRec.record.Duration,
+		writeRec.record.RequestBody, writeRec.record.ResponseBody, writeRec.reqHeadersString, writeRec.respHeadersString,
+		writeRec.record.RequestSize, writeRec.record.ResponseSize, writeRec.record.InputTokens, writeRec.record.OutputTokens,
+		writeRec.record.CacheReadInputTokens, writeRec.record.TotalTokens, writeRec.record.Cost)
+	if err != nil {
+		logger.Error("Failed to insert history record: %v", err)
+		return
+	}
+
+	// 更新首页缓存
+	updateHomeCache(writeRec.record)
+
+	logger.Info("[%s] %s %s | %s | %s | %d | %dms | in:%d out:%d",
+		writeRec.record.Method, writeRec.record.Path, writeRec.record.ClientIP, writeRec.record.Provider, writeRec.record.Model,
+		writeRec.record.StatusCode, writeRec.record.Duration, writeRec.record.InputTokens, writeRec.record.OutputTokens)
 }
 
 // loadHomeCache 加载首页缓存
@@ -221,7 +287,14 @@ func Shutdown() {
 	if history == nil {
 		return
 	}
+	// 1. 先停止接受新写入，处理完 channel 中剩余记录
 	close(history.quitChan)
+	history.shutdownWg.Wait()
+
+	// 2. 再关闭 broadcast（此时应无新 AddRecord 调用）
+	close(broadcast)
+
+	// 3. 最后关闭数据库连接
 	if db != nil {
 		db.Close()
 	}
@@ -245,22 +318,22 @@ func (h *History) handleBroadcast() {
 		clientsMu.RLock()
 		total := len(clients)
 		msg := gin.H{
-			"id":                     record.ID,
-			"total":                  total,
-			"timestamp":              record.Timestamp,
-			"method":                 record.Method,
-			"path":                   record.Path,
-			"client_ip":              record.ClientIP,
-			"key_id":                 record.KeyID,
-			"provider":               record.Provider,
-			"model":                  record.Model,
-			"status_code":            record.StatusCode,
-			"duration_ms":            record.Duration,
-			"input_tokens":           record.InputTokens,
-			"output_tokens":          record.OutputTokens,
+			"id":                      record.ID,
+			"total":                   total,
+			"timestamp":               record.Timestamp,
+			"method":                  record.Method,
+			"path":                    record.Path,
+			"client_ip":               record.ClientIP,
+			"key_id":                  record.KeyID,
+			"provider":                record.Provider,
+			"model":                   record.Model,
+			"status_code":             record.StatusCode,
+			"duration_ms":             record.Duration,
+			"input_tokens":            record.InputTokens,
+			"output_tokens":           record.OutputTokens,
 			"cache_read_input_tokens": record.CacheReadInputTokens,
-			"total_tokens":           record.TotalTokens,
-			"cost":                   record.Cost,
+			"total_tokens":            record.TotalTokens,
+			"cost":                    record.Cost,
 		}
 		for client := range clients {
 			err := client.WriteJSON(msg)
@@ -329,7 +402,12 @@ func BroadcastRecord(providerID, providerName, model string, inputTokens, output
 }
 
 func AddRecord(record RequestRecord) {
-	// Insert into SQLite
+	if history == nil {
+		logger.Error("History not initialized, cannot add record")
+		return
+	}
+
+	// 序列化 headers（在调用者 goroutine 中完成）
 	var reqHeaders, respHeaders string
 	if record.RequestHeaders != nil {
 		b, _ := json.Marshal(record.RequestHeaders)
@@ -340,31 +418,23 @@ func AddRecord(record RequestRecord) {
 		respHeaders = string(b)
 	}
 
-	_, err := db.Exec(`
-		INSERT INTO history (id, timestamp, method, path, client_ip, key_id, provider, model,
-			status_code, duration_ms, request_body, response_body, request_headers, response_headers,
-			request_size, response_size, input_tokens, output_tokens, cache_read_input_tokens, total_tokens, cost)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.Timestamp.UnixNano(), record.Method, record.Path, record.ClientIP,
-		record.KeyID, record.Provider, record.Model, record.StatusCode, record.Duration,
-		record.RequestBody, record.ResponseBody, reqHeaders, respHeaders,
-		record.RequestSize, record.ResponseSize, record.InputTokens, record.OutputTokens,
-		record.CacheReadInputTokens, record.TotalTokens, record.Cost)
-	if err != nil {
-		logger.Error("Failed to insert history record: %v", err)
+	// 异步写入数据库
+	select {
+	case history.writeChan <- recordWrite{
+		record:            record,
+		reqHeadersString:  reqHeaders,
+		respHeadersString: respHeaders,
+	}:
+		// 成功发送到写入队列
+	default:
+		// channel 满了，记录警告但不阻塞
+		logger.Warn("⚠️  History write channel full, dropping record: id=%s", record.ID)
 	}
-
-	// 更新首页缓存：头部插入新记录
-	updateHomeCache(record)
 
 	// Broadcast to WebSocket clients
 	go func(r RequestRecord) {
 		broadcast <- r
 	}(record)
-
-	logger.Info("[%s] %s %s | %s | %s | %d | %dms | in:%d out:%d",
-		record.Method, record.Path, record.ClientIP, record.Provider, record.Model,
-		record.StatusCode, record.Duration, record.InputTokens, record.OutputTokens)
 }
 
 // updateHomeCache 更新首页缓存，头部插入新记录
@@ -510,33 +580,33 @@ func GetRecordsSummary(page, pageSize int) ([]RecordSummary, int) {
 	// 移除缓存逻辑以确保分页一致性：始终使用数据库查询
 	// 避免因 homeCacheTotal 和实际数据库记录数不同步导致的分页错误
 	/*
-	if page == 1 && pageSize <= homeCacheSize {
-		homeCacheMu.RLock()
-		defer homeCacheMu.RUnlock()
+		if page == 1 && pageSize <= homeCacheSize {
+			homeCacheMu.RLock()
+			defer homeCacheMu.RUnlock()
 
-		summaries := make([]RecordSummary, 0, len(homeCache))
-		for _, r := range homeCache {
-			summaries = append(summaries, RecordSummary{
-				ID:           r.ID,
-				Timestamp:    r.Timestamp,
-				Method:       r.Method,
-				Path:         r.Path,
-				ClientIP:     r.ClientIP,
-				KeyID:        r.KeyID,
-				Provider:     r.Provider,
-				Model:        r.Model,
-				StatusCode:   r.StatusCode,
-				Duration:     r.Duration,
-				RequestSize:  r.RequestSize,
-				ResponseSize: r.ResponseSize,
-				InputTokens:  r.InputTokens,
-				OutputTokens: r.OutputTokens,
-				TotalTokens:  r.TotalTokens,
-				Cost:         r.Cost,
-			})
+			summaries := make([]RecordSummary, 0, len(homeCache))
+			for _, r := range homeCache {
+				summaries = append(summaries, RecordSummary{
+					ID:           r.ID,
+					Timestamp:    r.Timestamp,
+					Method:       r.Method,
+					Path:         r.Path,
+					ClientIP:     r.ClientIP,
+					KeyID:        r.KeyID,
+					Provider:     r.Provider,
+					Model:        r.Model,
+					StatusCode:   r.StatusCode,
+					Duration:     r.Duration,
+					RequestSize:  r.RequestSize,
+					ResponseSize: r.ResponseSize,
+					InputTokens:  r.InputTokens,
+					OutputTokens: r.OutputTokens,
+					TotalTokens:  r.TotalTokens,
+					Cost:         r.Cost,
+				})
+			}
+			return summaries, homeCacheTotal
 		}
-		return summaries, homeCacheTotal
-	}
 	*/
 
 	// Get total count

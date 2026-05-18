@@ -195,8 +195,7 @@ func (m *ConnProxyManager) CleanupIdle() int {
 		entry := value.(*ConnProxyEntry)
 		if entry.LastUsedAt.Before(cutoff) {
 			if m.proxies.CompareAndDelete(key, value) {
-				logger.Info("[ConnProxyManager] 清理空闲连接: %s (idle: %v, requests: %d)",
-					entry.RemoteAddr, time.Since(entry.LastUsedAt), entry.RequestCount)
+				logger.Info("[ConnProxyManager] 清理空闲连接: %s (idle: %v, requests: %d); provider: %s", entry.RemoteAddr, time.Since(entry.LastUsedAt), entry.RequestCount, entry.Provider.Name)
 				if entry.Proxy != nil {
 					_ = entry.Proxy.Close()
 				}

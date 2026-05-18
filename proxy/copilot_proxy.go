@@ -136,8 +136,6 @@ func (p *CopilotProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, r
 	_ = json.Unmarshal(modifiedBody, &req)
 	isStream, _ := req["stream"].(bool)
 
-	logger.Info("[CopilotProxy] Handling %s OpenAI request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
-
 	if isStream {
 		return p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
 	}
@@ -360,8 +358,6 @@ func (p *CopilotProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context
 	_ = json.Unmarshal(modifiedBody, &req)
 	isStream, _ := req["stream"].(bool)
 
-	logger.Info("[CopilotProxy] Handling %s Anthropic request: model=%s", map[bool]string{true: "stream", false: "non-stream"}[isStream], modelName)
-
 	if isStream {
 		return p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
 	}
@@ -382,7 +378,7 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	// 注入 Copilot headers
@@ -395,17 +391,17 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request: %w", err)
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := readResponseBody(resp)
 	if err != nil {
-		return err
+		return fmt.Errorf("read body | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(respBytes))
+		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))
 	}
 
 	// 转换 OpenAI 响应 -> Anthropic 格式
@@ -459,8 +455,6 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 		Cost:         cost,
 	})
 
-	logger.Info("✅ Copilot non-stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms", modelName, inputTokens, outputTokens, duration)
-
 	return nil
 }
 
@@ -475,7 +469,7 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	// 注入 Copilot headers
@@ -489,13 +483,13 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request: %w", err)
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("api error: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body))
 	}
 
 	// 设置流式响应头
@@ -505,7 +499,7 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("streaming not supported")
+		return fmt.Errorf("streaming not supported | model:%s provider:%s", modelName, p.provider.Name)
 	}
 
 	// 处理 Content-Encoding: gzip/brotli
@@ -548,7 +542,7 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan stream: %w", err)
+		return fmt.Errorf("scan stream | model:%s provider:%s | %w", modelName, p.provider.Name, err)
 	}
 
 	// 记录统计
@@ -592,9 +586,6 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:         cost,
 	})
-
-	logger.Info("✅ Copilot stream 完成: Model=%s, Tokens=%d+%d, Duration=%dms, TTFB=%dms",
-		modelName, inputTokens, outputTokens, duration, timeToFirst)
 
 	return nil
 }

@@ -367,22 +367,6 @@ func RecordUsage(providerID, providerName, model, group, reqType string, inputTo
 		Group:                group,
 		Type:                 reqType,
 	}
-
-	logger.Info("📊 Token统计 | 时间: %s | 密钥: %s | 令牌: %d输入/%d输出/%d缓存 | 分组: %s | 类型: %s | 模型: %s | 用时: %dms | 首字: %dms | 花费: ¥%.6f | IP: %s",
-		record.Timestamp.Format("15:04:05"),
-		maskKeyID(keyID),
-		inputTokens,
-		outputTokens,
-		cacheReadTokens,
-		group,
-		reqType,
-		model,
-		duration,
-		timeToFirst,
-		cost,
-		clientIP,
-	)
-
 	// Broadcast - block if channel is full to ensure delivery
 	stats.broadcast <- record
 }
