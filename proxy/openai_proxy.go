@@ -95,7 +95,27 @@ func (p *OpenAIProxy) Provider() *config.Provider {
 // 优化后的内部方法
 // ============================================================
 
-// parseAndProcessRequest 一次性解析并处理：模型映射 + stream 检查
+// OpenAIProxy 支持的参数（需要过滤掉不支持的参数）
+// OpenAI 原生支持的参数会被保留，不支持的会被过滤
+var supportedOpenAIParams = []string{
+	"model", "messages", "temperature", "top_p", "max_tokens",
+	"stream", "stream_options", "stop", "presence_penalty",
+	"frequency_penalty", "logit_bias", "user", "tools", "tool_choice",
+}
+
+// filterUnsupportedOpenAIParams 过滤 OpenAI 请求中不支持的参数
+func filterUnsupportedOpenAIParams(req map[string]interface{}) {
+	// 已知不支持的参数
+	unsupportedParams := []string{
+		"structured_outputs", // 部分 provider 不支持
+	}
+
+	for _, param := range unsupportedParams {
+		delete(req, param)
+	}
+}
+
+// parseAndProcessRequest 一次性解析并处理：模型映射 + stream 检查 + 参数过滤
 func (p *OpenAIProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
 	if err := json.Unmarshal(reqBody, &req); err != nil {
@@ -104,6 +124,9 @@ func (p *OpenAIProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bo
 
 	modelName := ""
 	isStream := false
+
+	// 过滤不支持的参数
+	filterUnsupportedOpenAIParams(req)
 
 	// 处理模型映射
 	if model, ok := req["model"].(string); ok {
@@ -280,7 +303,8 @@ func (p *OpenAIProxy) buildURL() string {
 }
 
 // HandleOpenAIFormat 处理 OpenAI 格式请求（包括发送和响应转发）
-func (p *OpenAIProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+// 返回: (error, statusCode)
+func (p *OpenAIProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
 	startTime := time.Now()
 	var firstTokenTime time.Time
 
@@ -298,14 +322,17 @@ func (p *OpenAIProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, re
 	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
 
 	if isStream {
-		return p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		err := p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		return err, 0
 	}
 
-	return p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	err := p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	return err, 0
 }
 
 // HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
-func (p *OpenAIProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+// 返回: (error, statusCode)
+func (p *OpenAIProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
 	startTime := time.Now()
 	var firstTokenTime time.Time
 
@@ -323,10 +350,12 @@ func (p *OpenAIProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context,
 	modifiedBody, modelName, isStream := p.convertAndProcessAnthropicRequest(reqBody)
 
 	if isStream {
-		return p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		err := p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		return err, 0
 	}
 
-	return p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	err := p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	return err, 0
 }
 
 // handleOpenAIStreamingResponse 处理流式响应
@@ -350,7 +379,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body))
+		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body)))
 	}
 
 	// 设置流式响应头

@@ -44,13 +44,13 @@ type ProxyResponse struct {
 type CcProxy interface {
 	// HandleOpenAIFormat 处理 OpenAI 格式请求（包括发送和响应转发）
 	// 内部处理：模型映射、发送请求、响应转发
-	// 返回：error（如果处理失败）
-	HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error
+	// 返回: (error, statusCode) - statusCode 为 0 表示无法从错误中提取状态码
+	HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int)
 
 	// HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
 	// 内部处理：模型映射、格式转换、发送请求、响应转换、响应转发
-	// 返回：error（如果处理失败）
-	HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error
+	// 返回: (error, statusCode) - statusCode 为 0 表示无法从错误中提取状态码
+	HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int)
 
 	// Close 释放代理资源
 	Close() error

@@ -31,6 +31,98 @@ type AnthropicProxy struct {
 	client   *http.Client
 }
 
+// AnthropicProxy 支持的内容块类型
+// Anthropic 格式请求本身支持: text, image, tool_use, tool_result, thinking, redacted_thinking
+// 只有从 OpenAI 格式转换时，才需要过滤不兼容的块
+var supportedAnthropicBlockTypes = []string{"text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"}
+
+// supportedAnthropicBlockTypesFromOpenAI 从 OpenAI 转换时允许的内容块类型
+// OpenAI 格式不包含 thinking/redacted_thinking，转换后也不应有
+var supportedAnthropicBlockTypesFromOpenAI = []string{"text", "image", "tool_use", "tool_result"}
+
+// filterUnsupportedContentBlocks 过滤不支持的内容块
+// allowedTypes 参数指定允许的内容块类型列表
+// 注意：如果过滤后为空（包括原始空数组），返回空文本块以保持请求结构有效
+func filterUnsupportedContentBlocks(content interface{}, allowedTypes []string) interface{} {
+	if content == nil {
+		return content
+	}
+
+	// 字符串内容直接返回
+	if _, ok := content.(string); ok {
+		return content
+	}
+
+	// 处理数组类型的内容块
+	blocks, ok := content.([]interface{})
+	if !ok {
+		return content
+	}
+
+	// 创建允许类型集合
+	typeSet := make(map[string]bool)
+	for _, t := range allowedTypes {
+		typeSet[t] = true
+	}
+
+	var filtered []interface{}
+	var filteredTypes []string
+	for _, block := range blocks {
+		bm, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := bm["type"].(string)
+
+		if typeSet[blockType] {
+			filtered = append(filtered, block)
+		} else if blockType != "" {
+			filteredTypes = append(filteredTypes, blockType)
+		}
+	}
+
+	// 如果过滤后为空（包括原始空数组的情况），返回空文本块
+	if len(filtered) == 0 {
+		if len(blocks) > 0 && len(filteredTypes) > 0 {
+			logger.Warn("All content blocks were filtered (types: %v), returning empty text block", filteredTypes)
+		}
+		return []interface{}{
+			map[string]interface{}{"type": "text", "text": ""},
+		}
+	}
+
+	// 如果有部分内容被过滤，记录日志
+	if len(filtered) < len(blocks) {
+		logger.Info("Filtered unsupported block types: %v", filteredTypes)
+	}
+
+	return filtered
+}
+
+// filterMessagesContentBlocks 过滤消息数组中不兼容的内容块
+func filterMessagesContentBlocks(messages interface{}, allowedTypes []string) interface{} {
+	if messages == nil {
+		return messages
+	}
+
+	msgs, ok := messages.([]interface{})
+	if !ok {
+		return messages
+	}
+
+	for _, msg := range msgs {
+		msgMap, ok := msg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if content, ok := msgMap["content"]; ok {
+			msgMap["content"] = filterUnsupportedContentBlocks(content, allowedTypes)
+		}
+	}
+
+	return msgs
+}
+
 // NewAnthropicProxy 创建 Anthropic 代理实例
 func NewAnthropicProxy(provider *config.Provider) (CcProxy, error) {
 	if provider.IsOpenAIFormat {
@@ -51,10 +143,8 @@ func NewAnthropicProxy(provider *config.Provider) (CcProxy, error) {
 }
 
 // SendAnthropicFormat 发送 Anthropic 格式请求
-// 优化：单次 JSON 解析完成模型映射 + stream 检查
 func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
-	// 1. 一次性解析并处理：模型映射 + stream 检查
-	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
+	modifiedBody, modelName, isStream := p.parseAnthropicRequest(reqBody)
 
 	if isStream {
 		resp := p.sendAnthropicStream(ctx, reqHdr, modifiedBody)
@@ -67,13 +157,8 @@ func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.He
 }
 
 // SendOpenAIFormat 发送 OpenAI 格式请求
-// 优化：转换 + 模型映射 + stream 检查一次性完成
 func (p *AnthropicProxy) SendOpenAIFormat(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
-	// 1. 过滤不支持的参数（OpenAI 格式可能包含 Anthropic 不支持的参数）
-	reqBody = FilterUnsupportedParams(reqBody, "anthropic")
-
-	// 2. 转换并处理：OpenAI → Anthropic + 模型映射 + stream 检查
-	modifiedBody, modelName, isStream := p.convertAndProcessOpenAIRequest(reqBody)
+	modifiedBody, modelName, isStream := p.parseOpenAIRequest(reqBody)
 
 	if isStream {
 		resp := p.sendAnthropicStream(ctx, reqHdr, modifiedBody)
@@ -86,7 +171,8 @@ func (p *AnthropicProxy) SendOpenAIFormat(ctx context.Context, reqHdr http.Heade
 }
 
 // HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
-func (p *AnthropicProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+// 返回: (error, statusCode)
+func (p *AnthropicProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
 	startTime := time.Now()
 	var firstTokenTime time.Time
 
@@ -100,8 +186,8 @@ func (p *AnthropicProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Conte
 	method := c.Request.Method
 	path := c.Request.URL.Path
 
-	// 1. 一次性解析并处理：模型映射 + stream 检查
-	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
+	// 解析：模型映射 + stream 检查 + 过滤不支持参数（一次 JSON 解析完成）
+	modifiedBody, modelName, isStream := p.parseAnthropicRequest(reqBody)
 
 	if isStream {
 		return p.handleAnthropicStreamingResponse(ctx, c, reqHdr, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
@@ -111,7 +197,8 @@ func (p *AnthropicProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Conte
 }
 
 // HandleOpenAIFormat 处理 OpenAI 格式请求（包括发送和响应转发）
-func (p *AnthropicProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+// 返回: (error, statusCode)
+func (p *AnthropicProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
 	startTime := time.Now()
 	var firstTokenTime time.Time
 
@@ -125,11 +212,8 @@ func (p *AnthropicProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context,
 	method := c.Request.Method
 	path := c.Request.URL.Path
 
-	// 1. 过滤不支持的参数
-	reqBody = FilterUnsupportedParams(reqBody, "anthropic")
-
-	// 2. 转换并处理：OpenAI → Anthropic + 模型映射 + stream 检查
-	modifiedBody, modelName, isStream := p.convertAndProcessOpenAIRequest(reqBody)
+	// 解析：OpenAI → Anthropic 转换 + 模型映射 + stream 检查 + 过滤不支持参数和内容块
+	modifiedBody, modelName, isStream := p.parseOpenAIRequest(reqBody)
 
 	if isStream {
 		return p.handleAnthropicStreamingResponse(ctx, c, reqHdr, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
@@ -153,9 +237,10 @@ func (p *AnthropicProxy) Provider() *config.Provider {
 // 优化后的内部方法
 // ============================================================
 
-// parseAndProcessRequest 一次性解析并处理：模型映射 + stream 检查
-// 优化：从原来的 2 次 JSON 解析 + 1 次序列化 → 1 次解析 + 1 次序列化
-func (p *AnthropicProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bool) {
+// parseAnthropicRequest 解析 Anthropic 格式请求：模型映射 + stream 检查 + 过滤不支持参数
+// 一次 JSON 解析完成所有操作，避免多次 marshal/unmarshal
+// Anthropic → Anthropic：不过滤内容块，thinking 等块保持原样
+func (p *AnthropicProxy) parseAnthropicRequest(reqBody []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
 	if err := json.Unmarshal(reqBody, &req); err != nil {
 		return reqBody, "", false
@@ -163,6 +248,11 @@ func (p *AnthropicProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string,
 
 	modelName := ""
 	isStream := false
+
+	// 过滤不支持的参数（如 structured_outputs, parallel_tool_calls）
+	for _, key := range unsupportedParams["anthropic"] {
+		delete(req, key)
+	}
 
 	// 处理模型映射
 	if model, ok := req["model"].(string); ok {
@@ -180,14 +270,13 @@ func (p *AnthropicProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string,
 		isStream = v
 	}
 
-	// 一次性序列化
 	result, _ := json.Marshal(req)
 	return result, modelName, isStream
 }
 
-// convertAndProcessOpenAIRequest 转换 OpenAI → Anthropic + 模型映射 + stream 检查
-// 优化：从原来的 4 次 JSON 处理 → 2 次
-func (p *AnthropicProxy) convertAndProcessOpenAIRequest(openaiReq []byte) ([]byte, string, bool) {
+// parseOpenAIRequest 解析 OpenAI 格式请求并转换为 Anthropic 格式
+// 一次 JSON 解析完成：格式转换 + 模型映射 + stream 检查 + 过滤不支持参数和内容块
+func (p *AnthropicProxy) parseOpenAIRequest(openaiReq []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
 	if err := json.Unmarshal(openaiReq, &req); err != nil {
 		return nil, "", false
@@ -220,6 +309,11 @@ func (p *AnthropicProxy) convertAndProcessOpenAIRequest(openaiReq []byte) ([]byt
 		anthropicReq["tool_choice"] = map[string]interface{}{"type": "auto"}
 	}
 
+	// 过滤不支持的参数（如 structured_outputs, parallel_tool_calls）
+	for _, key := range unsupportedParams["anthropic"] {
+		delete(anthropicReq, key)
+	}
+
 	// 处理模型映射
 	if model, ok := anthropicReq["model"].(string); ok {
 		resolved := p.provider.ResolveModel(model)
@@ -236,7 +330,9 @@ func (p *AnthropicProxy) convertAndProcessOpenAIRequest(openaiReq []byte) ([]byt
 		isStream = v
 	}
 
-	// 一次性序列化
+	// 过滤不兼容的内容块（OpenAI 格式不应包含 thinking 块，做防御性过滤）
+	anthropicReq["messages"] = filterMessagesContentBlocks(anthropicReq["messages"], supportedAnthropicBlockTypesFromOpenAI)
+
 	result, _ := json.Marshal(anthropicReq)
 	return result, modelName, isStream
 }
@@ -399,11 +495,11 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 }
 
 // handleAnthropicNonStreamingResponse 处理非流式响应
-func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) error {
+func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) (error, int) {
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -414,17 +510,17 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	req.Header.Set("anthropic-version", "2023-06-01")
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := readResponseBody(resp)
 	if err != nil {
-		return fmt.Errorf("read body | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("read body | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))
+		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))), resp.StatusCode
 	}
 
 	// 解析 token 统计
@@ -470,15 +566,15 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:                 cost,
 	})
-	return nil
+	return nil, 0
 }
 
 // handleAnthropicStreamingResponse 处理流式响应
-func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) error {
+func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) (error, int) {
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	// 设置必要的请求头
@@ -503,13 +599,13 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request: %w; %s:%s", err, modelName, p.provider.Name)
+		return fmt.Errorf("send request: %w; %s:%s", err, modelName, p.provider.Name), 0
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body))
+		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body)), resp.StatusCode
 	}
 
 	// 设置流式响应头
@@ -519,7 +615,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("streaming not supported | model:%s provider:%s", modelName, p.provider.Name)
+		return fmt.Errorf("streaming not supported | model:%s provider:%s", modelName, p.provider.Name), 0
 	}
 
 	// 处理 Content-Encoding: gzip/brotli
@@ -530,7 +626,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 		case "gzip":
 			gzReader, err := gzip.NewReader(resp.Body)
 			if err != nil {
-				return fmt.Errorf("gzip decompress: %w", err)
+				return fmt.Errorf("gzip decompress: %w", err), 0
 			}
 			defer gzReader.Close()
 			reader = gzReader
@@ -572,7 +668,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan stream | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("scan stream | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	// 记录统计
@@ -620,5 +716,5 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:                 cost,
 	})
-	return nil
+	return nil, 0
 }

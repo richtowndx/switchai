@@ -233,3 +233,169 @@ func TestConvertOpenAIToClaudeWithToolCalls(t *testing.T) {
 		t.Error("missing tool_use block")
 	}
 }
+
+func TestFilterUnsupportedContentBlocks(t *testing.T) {
+	// 测试 OpenAI → Anthropic 转换场景（过滤 thinking）
+	openaiAllowedTypes := []string{"text", "image", "tool_use", "tool_result"}
+
+	tests := []struct {
+		name        string
+		content     interface{}
+		allowedTypes []string
+		wantText    bool
+		wantLen     int
+	}{
+		{
+			name: "filter thinking block (OpenAI conversion)",
+			content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "Hello"},
+				map[string]interface{}{"type": "thinking", "thinking": "Let me think..."},
+				map[string]interface{}{"type": "redacted_thinking", "thinking": "..."},
+			},
+			allowedTypes: openaiAllowedTypes,
+			wantText: true,
+			wantLen:  1,
+		},
+		{
+			name: "preserve thinking block (Anthropic passthrough)",
+			content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "Hello"},
+				map[string]interface{}{"type": "thinking", "thinking": "Let me think..."},
+			},
+			allowedTypes: supportedAnthropicBlockTypes, // includes thinking
+			wantText: true,
+			wantLen:  2,
+		},
+		{
+			name: "preserve text block",
+			content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "Hello world"},
+			},
+			allowedTypes: openaiAllowedTypes,
+			wantText: true,
+			wantLen:  1,
+		},
+		{
+			name: "preserve tool_use block",
+			content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "Let me use a tool"},
+				map[string]interface{}{"type": "tool_use", "id": "toolu_1", "name": "search", "input": map[string]interface{}{}},
+			},
+			allowedTypes: openaiAllowedTypes,
+			wantText: true,
+			wantLen:  2,
+		},
+		{
+			name:     "empty array returns empty text block",
+			content:  []interface{}{},
+			allowedTypes: openaiAllowedTypes,
+			wantText: true,
+			wantLen:  1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := filterUnsupportedContentBlocks(tt.content, tt.allowedTypes)
+
+			if tt.wantLen == 1 && tt.wantText {
+				blocks, ok := result.([]interface{})
+				if !ok {
+					t.Fatalf("result is not a slice")
+				}
+				if len(blocks) != 1 {
+					t.Errorf("len = %d, want 1", len(blocks))
+				}
+				if block, ok := blocks[0].(map[string]interface{}); ok {
+					if block["type"] != "text" {
+						t.Errorf("block type = %v, want text", block["type"])
+					}
+				}
+			} else if blocks, ok := result.([]interface{}); ok {
+				if len(blocks) != tt.wantLen {
+					t.Errorf("len = %d, want %d", len(blocks), tt.wantLen)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterMessagesContentBlocks(t *testing.T) {
+	openaiAllowedTypes := []string{"text", "image", "tool_use", "tool_result"}
+
+	messages := []interface{}{
+		map[string]interface{}{
+			"role":    "user",
+			"content": "Hello",
+		},
+		map[string]interface{}{
+			"role": "assistant",
+			"content": []interface{}{
+				map[string]interface{}{"type": "thinking", "thinking": "Let me think..."},
+				map[string]interface{}{"type": "text", "text": "I think it's 42"},
+			},
+		},
+		map[string]interface{}{
+			"role": "assistant",
+			"content": []interface{}{
+				map[string]interface{}{"type": "redacted_thinking", "thinking": "..."},
+				map[string]interface{}{"type": "thinking", "thinking": "..."},
+				map[string]interface{}{"type": "text", "text": "Final answer"},
+			},
+		},
+	}
+
+	// OpenAI→Anthropic 转换场景：thinking 块应被过滤
+	result := filterMessagesContentBlocks(messages, openaiAllowedTypes)
+
+	resultMsgs, ok := result.([]interface{})
+	if !ok {
+		t.Fatalf("result is not a slice")
+	}
+
+	if len(resultMsgs) != 3 {
+		t.Errorf("message count = %d, want 3", len(resultMsgs))
+	}
+
+	// 第二个消息应该只剩下 text block
+	msg2 := resultMsgs[1].(map[string]interface{})
+	blocks2 := msg2["content"].([]interface{})
+	if len(blocks2) != 1 {
+		t.Errorf("second message content blocks = %d, want 1", len(blocks2))
+	}
+
+	// 第三个消息应该只剩下 text block
+	msg3 := resultMsgs[2].(map[string]interface{})
+	blocks3 := msg3["content"].([]interface{})
+	if len(blocks3) != 1 {
+		t.Errorf("third message content blocks = %d, want 1", len(blocks3))
+	}
+}
+
+func TestFilterUnsupportedOpenAIParams(t *testing.T) {
+	req := map[string]interface{}{
+		"model":              "gpt-4o",
+		"messages":           []interface{}{},
+		"temperature":        0.7,
+		"structured_outputs": true,
+		"response_format":    map[string]interface{}{"type": "json_object"},
+	}
+
+	filterUnsupportedOpenAIParams(req)
+
+	// structured_outputs 应该被过滤
+	if _, ok := req["structured_outputs"]; ok {
+		t.Error("structured_outputs should be filtered out")
+	}
+	// response_format 不在过滤列表中，会保留（可选参数）
+	if _, ok := req["response_format"]; !ok {
+		t.Error("response_format should be preserved (not in filter list)")
+	}
+	// 标准参数应该保留
+	if _, ok := req["model"]; !ok {
+		t.Error("model should be preserved")
+	}
+	if _, ok := req["temperature"]; !ok {
+		t.Error("temperature should be preserved")
+	}
+}

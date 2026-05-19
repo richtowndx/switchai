@@ -111,7 +111,8 @@ func (p *CopilotProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Head
 }
 
 // HandleOpenAIFormat 处理 OpenAI 格式请求（包括发送和响应转发）
-func (p *CopilotProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+// 返回: (error, statusCode)
+func (p *CopilotProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
 	startTime := time.Now()
 	var firstTokenTime time.Time
 
@@ -137,10 +138,12 @@ func (p *CopilotProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, r
 	isStream, _ := req["stream"].(bool)
 
 	if isStream {
-		return p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		err := p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		return err, 0
 	}
 
-	return p.handleCopilotNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	err := p.handleCopilotNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	return err, 0
 }
 
 // Close 释放资源
@@ -322,7 +325,8 @@ func (p *CopilotProxy) buildURL() string {
 
 // HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
 // Copilot 需要：Anthropic → OpenAI 转换 → 发送 → OpenAI → Anthropic 转换 → 转发
-func (p *CopilotProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) error {
+// 返回: (error, statusCode)
+func (p *CopilotProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
 	startTime := time.Now()
 	var firstTokenTime time.Time
 
@@ -339,7 +343,7 @@ func (p *CopilotProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context
 	// 1. 转换 Anthropic -> OpenAI
 	openaiBody, modelName, err := p.convertAnthropicToOpenAI(reqBody)
 	if err != nil {
-		return err
+		return err, 0
 	}
 
 	logger.Info("Converted Anthropic->OpenAI body: %s", string(openaiBody))
@@ -359,10 +363,12 @@ func (p *CopilotProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context
 	isStream, _ := req["stream"].(bool)
 
 	if isStream {
-		return p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		err = p.handleCopilotStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+		return err, 0
 	}
 
-	return p.handleCopilotNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	err = p.handleCopilotNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+	return err, 0
 }
 
 // handleCopilotNonStreamingResponse 处理 Copilot 非流式响应
@@ -401,7 +407,7 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))
+		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes)))
 	}
 
 	// 转换 OpenAI 响应 -> Anthropic 格式
