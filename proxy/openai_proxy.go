@@ -322,12 +322,10 @@ func (p *OpenAIProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context, re
 	modifiedBody, modelName, isStream := p.parseAndProcessRequest(reqBody)
 
 	if isStream {
-		err := p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
-		return err, 0
+		return p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
 	}
 
-	err := p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
-	return err, 0
+	return p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
 }
 
 // HandleAnthropicFormat 处理 Anthropic 格式请求（包括发送和响应转发）
@@ -350,20 +348,18 @@ func (p *OpenAIProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context,
 	modifiedBody, modelName, isStream := p.convertAndProcessAnthropicRequest(reqBody)
 
 	if isStream {
-		err := p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
-		return err, 0
+		return p.handleOpenAIStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
 	}
 
-	err := p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
-	return err, 0
+	return p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
 }
 
 // handleOpenAIStreamingResponse 处理流式响应
-func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) error {
+func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) (error, int) {
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	// 设置请求头
@@ -373,13 +369,13 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body)))
+		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body))), resp.StatusCode
 	}
 
 	// 设置流式响应头
@@ -389,7 +385,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
-		return fmt.Errorf("streaming not supported | model:%s provider:%s", modelName, p.provider.Name)
+		return fmt.Errorf("streaming not supported | model:%s provider:%s", modelName, p.provider.Name), 0
 	}
 
 	// 流式转发
@@ -425,7 +421,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scan stream | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("scan stream | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	// 记录统计
@@ -473,15 +469,15 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:                 cost,
 	})
-	return nil
+	return nil, 0
 }
 
 // handleOpenAINonStreamingResponse 处理非流式响应
-func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) error {
+func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) (error, int) {
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
-		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -489,17 +485,17 @@ func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *g
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 	defer resp.Body.Close()
 
 	respBytes, err := readResponseBody(resp)
 	if err != nil {
-		return fmt.Errorf("read body | model:%s provider:%s | %w", modelName, p.provider.Name, err)
+		return fmt.Errorf("read body | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))
+		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))), resp.StatusCode
 	}
 
 	// 解析 token 统计
@@ -545,5 +541,5 @@ func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *g
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
 		Cost:                 cost,
 	})
-	return nil
+	return nil, 0
 }
