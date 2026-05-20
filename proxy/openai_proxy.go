@@ -95,25 +95,10 @@ func (p *OpenAIProxy) Provider() *config.Provider {
 // 优化后的内部方法
 // ============================================================
 
-// OpenAIProxy 支持的参数（需要过滤掉不支持的参数）
-// OpenAI 原生支持的参数会被保留，不支持的会被过滤
-var supportedOpenAIParams = []string{
-	"model", "messages", "temperature", "top_p", "max_tokens",
-	"stream", "stream_options", "stop", "presence_penalty",
-	"frequency_penalty", "logit_bias", "user", "tools", "tool_choice",
-}
-
-// filterUnsupportedOpenAIParams 过滤 OpenAI 请求中不支持的参数
-func filterUnsupportedOpenAIParams(req map[string]interface{}) {
-	// 已知不支持的参数
-	unsupportedParams := []string{
-		"structured_outputs", // 部分 provider 不支持
-	}
-
-	for _, param := range unsupportedParams {
-		delete(req, param)
-	}
-}
+// supportedOpenAIBlockTypesFromAnthropic 从 Anthropic 转换到 OpenAI 时允许的内容块类型
+// OpenAI 格式不包含 thinking/redacted_thinking，需要过滤
+// image 块在 convertAnthropicContentToOpenAI 中已转换为 image_url
+var supportedOpenAIBlockTypesFromAnthropic = []string{"text", "image_url"}
 
 // parseAndProcessRequest 一次性解析并处理：模型映射 + stream 检查 + 参数过滤
 func (p *OpenAIProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bool) {
@@ -125,8 +110,10 @@ func (p *OpenAIProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bo
 	modelName := ""
 	isStream := false
 
-	// 过滤不支持的参数
-	filterUnsupportedOpenAIParams(req)
+	// 过滤不支持的参数（如 structured_outputs）
+	for _, key := range getFilterParams(p.provider.Hostname, "openai") {
+		delete(req, key)
+	}
 
 	// 处理模型映射
 	if model, ok := req["model"].(string); ok {
@@ -150,6 +137,7 @@ func (p *OpenAIProxy) parseAndProcessRequest(reqBody []byte) ([]byte, string, bo
 }
 
 // convertAndProcessAnthropicRequest 转换 Anthropic → OpenAI + 模型映射 + stream 检查
+// 白名单方式构建：只复制 OpenAI 支持的字段，不支持的自动丢弃
 func (p *OpenAIProxy) convertAndProcessAnthropicRequest(anthropicReq []byte) ([]byte, string, bool) {
 	var req map[string]interface{}
 	if err := json.Unmarshal(anthropicReq, &req); err != nil {
@@ -161,11 +149,11 @@ func (p *OpenAIProxy) convertAndProcessAnthropicRequest(anthropicReq []byte) ([]
 		modelName = model
 	}
 
-	// 构建 OpenAI 格式
+	// 构建 OpenAI 格式（白名单方式，不复制 Anthropic 特有字段）
 	openaiReq := map[string]interface{}{
 		"model":      req["model"],
 		"max_tokens": req["max_tokens"],
-		"messages":   convertAnthropicMessagesToOpenAI(req["messages"], nil),
+		"messages":   convertAnthropicMessagesToOpenAI(req["messages"], req["system"]),
 	}
 
 	if v, ok := req["temperature"].(float64); ok && v > 0 {
@@ -178,9 +166,33 @@ func (p *OpenAIProxy) convertAndProcessAnthropicRequest(anthropicReq []byte) ([]
 		openaiReq["stream"] = v
 	}
 
+	// stop_sequences → stop 转换（Anthropic 用 stop_sequences，OpenAI 用 stop）
+	if stopSeqs, ok := req["stop_sequences"].([]interface{}); ok && len(stopSeqs) > 0 {
+		if len(stopSeqs) == 1 {
+			if s, ok := stopSeqs[0].(string); ok {
+				openaiReq["stop"] = s
+			}
+		} else {
+			stops := make([]string, 0, len(stopSeqs))
+			for _, s := range stopSeqs {
+				if str, ok := s.(string); ok {
+					stops = append(stops, str)
+				}
+			}
+			if len(stops) > 0 {
+				openaiReq["stop"] = stops
+			}
+		}
+	}
+
 	if tools, ok := req["tools"].([]interface{}); ok {
 		openaiReq["tools"] = convertAnthropicToolsToOpenAI(tools)
 		openaiReq["tool_choice"] = "auto"
+	}
+
+	// 过滤 OpenAI 不支持的参数（如 structured_outputs）
+	for _, key := range getFilterParams(p.provider.Hostname, "openai") {
+		delete(openaiReq, key)
 	}
 
 	// 处理模型映射
@@ -197,6 +209,17 @@ func (p *OpenAIProxy) convertAndProcessAnthropicRequest(anthropicReq []byte) ([]
 	isStream := false
 	if v, ok := openaiReq["stream"].(bool); ok {
 		isStream = v
+	}
+
+	// 过滤不兼容的内容块（Anthropic thinking/redacted_thinking 等 OpenAI 不支持的块）
+	if msgs, ok := openaiReq["messages"].([]interface{}); ok {
+		for _, msg := range msgs {
+			if msgMap, ok := msg.(map[string]interface{}); ok {
+				if content, exists := msgMap["content"]; exists {
+					msgMap["content"] = filterUnsupportedContentBlocks(content, supportedOpenAIBlockTypesFromAnthropic)
+				}
+			}
+		}
 	}
 
 	// 一次性序列化

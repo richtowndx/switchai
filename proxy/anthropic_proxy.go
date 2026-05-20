@@ -249,8 +249,9 @@ func (p *AnthropicProxy) parseAnthropicRequest(reqBody []byte) ([]byte, string, 
 	modelName := ""
 	isStream := false
 
-	// 过滤不支持的参数（如 structured_outputs, parallel_tool_calls）
-	for _, key := range unsupportedParams["anthropic"] {
+	// 基于 hostname 过滤不支持的参数
+	for _, key := range getFilterParams(p.provider.Hostname, "anthropic") {
+		logger.Info("remove %s unsupported parameter: %s", p.provider.Hostname, key)
 		delete(req, key)
 	}
 
@@ -263,6 +264,12 @@ func (p *AnthropicProxy) parseAnthropicRequest(reqBody []byte) ([]byte, string, 
 			req["model"] = resolved
 			modelName = resolved
 		}
+	} else {
+		// model 字段缺失，添加默认模型并记录错误日志
+		defaultModel := p.provider.ResolveModel("default_model")
+		req["model"] = defaultModel
+		modelName = defaultModel
+		logger.Error("[MissingModel] Request missing 'model' field, added default: %s (provider: %s)", defaultModel, p.provider.Name)
 	}
 
 	// 检查 stream
@@ -309,8 +316,9 @@ func (p *AnthropicProxy) parseOpenAIRequest(openaiReq []byte) ([]byte, string, b
 		anthropicReq["tool_choice"] = map[string]interface{}{"type": "auto"}
 	}
 
-	// 过滤不支持的参数（如 structured_outputs, parallel_tool_calls）
-	for _, key := range unsupportedParams["anthropic"] {
+	// 基于 hostname 过滤不支持的参数
+	for _, key := range getFilterParams(p.provider.Hostname, "anthropic") {
+		logger.Info("remove %s unsupported parameter: %s", p.provider.Hostname, key)
 		delete(anthropicReq, key)
 	}
 
@@ -520,6 +528,7 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		logger.Error("api error | status=%d req %s resp=%s", resp.StatusCode, string(reqBody), string(respBytes))
 		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))), resp.StatusCode
 	}
 

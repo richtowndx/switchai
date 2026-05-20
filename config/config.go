@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"net/url"
 	"sort"
 	"switchai/appdata"
 	"sync"
@@ -24,6 +25,7 @@ type Provider struct {
 	ID                   string `json:"id"`
 	Name                 string `json:"name"`
 	BaseURL              string `json:"base_url"`
+	Hostname             string `json:"hostname"` // 这个字段用于根据请求的 Host 头匹配提供商，需要从 BaseURL 解析得到，不由用户输入
 	APIKey               string `json:"api_key"`
 	Model                string `json:"model"`         // 兼容旧字段
 	DefaultModel         string `json:"default_model"` // 默认模型
@@ -43,6 +45,18 @@ type Provider struct {
 // IsCopilot 返回是否为 Copilot 提供商
 func (p *Provider) IsCopilot() bool {
 	return p.CopilotBaseURL != ""
+}
+
+// ParseHostname 从 BaseURL 中提取 hostname 并缓存到 Hostname 字段
+func (p *Provider) ParseHostname() {
+	if p.BaseURL == "" {
+		return
+	}
+	u, err := url.Parse(p.BaseURL)
+	if err != nil || u.Host == "" {
+		return
+	}
+	p.Hostname = u.Hostname()
 }
 
 // ResolveModel 根据传入的模型键名查找供应商对应的实际模型名
@@ -279,6 +293,7 @@ func (c *Config) Load() error {
 		}
 		p.IsActive = isActive == 1
 		p.IsOpenAIFormat = isOpenAIFormat == 1
+		p.ParseHostname()
 		c.Providers = append(c.Providers, p)
 	}
 
@@ -496,6 +511,7 @@ func (c *Config) AddProvider(p Provider) error {
 		}
 	}
 	p.Order = maxOrder + 1
+	p.ParseHostname()
 
 	c.Providers = append(c.Providers, p)
 
@@ -518,6 +534,7 @@ func (c *Config) UpdateProvider(id string, p Provider) error {
 		if c.Providers[i].ID == id {
 			// 保留原有序号
 			p.Order = c.Providers[i].Order
+			p.ParseHostname()
 			c.Providers[i] = p
 			c.sortProviders()
 			return c.save()

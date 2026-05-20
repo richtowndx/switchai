@@ -373,19 +373,35 @@ func TestFilterMessagesContentBlocks(t *testing.T) {
 }
 
 func TestFilterUnsupportedOpenAIParams(t *testing.T) {
-	req := map[string]interface{}{
-		"model":              "gpt-4o",
-		"messages":           []interface{}{},
-		"temperature":        0.7,
-		"structured_outputs": true,
-		"response_format":    map[string]interface{}{"type": "json_object"},
+	// 验证 defaultFilterParams["openai"] 包含 output_config
+	params := defaultFilterParams["openai"]
+	found := false
+	for _, p := range params {
+		if p == "output_config" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("output_config should be in defaultFilterParams[openai]")
 	}
 
-	filterUnsupportedOpenAIParams(req)
+	// 验证过滤逻辑
+	req := map[string]interface{}{
+		"model":         "gpt-4o",
+		"messages":      []interface{}{},
+		"temperature":   0.7,
+		"output_config": map[string]interface{}{"format": "json"},
+		"response_format": map[string]interface{}{"type": "json_object"},
+	}
 
-	// structured_outputs 应该被过滤
-	if _, ok := req["structured_outputs"]; ok {
-		t.Error("structured_outputs should be filtered out")
+	for _, key := range defaultFilterParams["openai"] {
+		delete(req, key)
+	}
+
+	// output_config 应该被过滤
+	if _, ok := req["output_config"]; ok {
+		t.Error("output_config should be filtered out")
 	}
 	// response_format 不在过滤列表中，会保留（可选参数）
 	if _, ok := req["response_format"]; !ok {
