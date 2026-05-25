@@ -385,7 +385,7 @@ func (p *OpenAIProxy) HandleCodexFormat(ctx context.Context, c *gin.Context, req
 		requestID = c.GetString("request_id")
 	}
 	method := "POST"
-	path := "/chat/completions"
+	path := c.Request.URL.Path
 
 	modifiedBody, modelName, isStream := p.parseAndProcessCodexRequest(reqBody)
 

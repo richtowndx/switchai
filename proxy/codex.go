@@ -91,6 +91,27 @@ func convertCodexToChat(req map[string]interface{}, provider *config.Provider) m
 						role = "system"
 					}
 					content := extractResponsesTextContent(itemMap["content"])
+
+					// Merge assistant text into the last assistant message when the
+					// previous item was a function_call (which created an assistant
+					// message with tool_calls). Responses API interleaves function_call
+					// and message(assistant) items, but both OpenAI Chat and Anthropic
+					// Messages APIs require tool_calls to be resolved by tool messages
+					// before the next assistant message appears.
+					if role == "assistant" && len(messages) > 0 {
+						if last, ok := messages[len(messages)-1].(map[string]interface{}); ok && last["role"] == "assistant" {
+							if _, hasTC := last["tool_calls"]; hasTC {
+								existingContent, _ := last["content"].(string)
+								if existingContent != "" && content != "" {
+									last["content"] = existingContent + content
+								} else if content != "" {
+									last["content"] = content
+								}
+								continue
+							}
+						}
+					}
+
 					messages = append(messages, map[string]interface{}{
 						"role":    role,
 						"content": content,
@@ -102,19 +123,31 @@ func convertCodexToChat(req map[string]interface{}, provider *config.Provider) m
 					}
 					name, _ := itemMap["name"].(string)
 					arguments, _ := itemMap["arguments"].(string)
+
+					toolCall := map[string]interface{}{
+						"id":   callID,
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      name,
+							"arguments": arguments,
+						},
+					}
+
+						// Merge tool_call into the last assistant message if one exists.
+						// Responses API interleaves function_call and message items, but
+						// both OpenAI Chat and Anthropic APIs require all tool_calls
+						// to be grouped in a single assistant message per round.
+						if len(messages) > 0 {
+							if last, ok := messages[len(messages)-1].(map[string]interface{}); ok && last["role"] == "assistant" {
+								existingCalls, _ := last["tool_calls"].([]interface{})
+								last["tool_calls"] = append(existingCalls, toolCall)
+								continue
+							}
+						}
 					messages = append(messages, map[string]interface{}{
 						"role":    "assistant",
 						"content": nil,
-						"tool_calls": []interface{}{
-							map[string]interface{}{
-								"id":   callID,
-								"type": "function",
-								"function": map[string]interface{}{
-									"name":      name,
-									"arguments": arguments,
-								},
-							},
-						},
+						"tool_calls": []interface{}{toolCall},
 					})
 				case "function_call_output":
 					callID, _ := itemMap["call_id"].(string)
