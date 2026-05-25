@@ -158,7 +158,7 @@ func startServer(port string) {
 	// 启动服务器
 	go func() {
 		logger.Info("Starting SwitchAI HTTP service on %s", addr)
-		logger.Info("🚀 SwitchAI is running on http://localhost%s", port)
+		logger.Info("🚀 SwitchAI is running on http://0.0.0.0:%s", port)
 		logger.Info("📊 Connection tracking: ENABLED")
 
 		// 使用 TrackedListener 启动 HTTP

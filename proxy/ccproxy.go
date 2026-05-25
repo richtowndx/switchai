@@ -51,6 +51,11 @@ type CcProxy interface {
 	// 返回: (error, statusCode) - statusCode 为 0 表示无法从错误中提取状态码
 	HandleAnthropicFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int)
 
+	// HandleCodexFormat 处理 Codex /responses 格式请求
+	// 内部处理：Responses API → Chat Completions 转换、发送请求、响应转换、响应转发
+	// 返回: (error, statusCode)
+	HandleCodexFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int)
+
 	// Close 释放代理资源
 	Close() error
 

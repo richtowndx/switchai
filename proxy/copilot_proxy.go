@@ -1,8 +1,8 @@
 package proxy
 
 import (
-	"bytes"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -106,7 +106,7 @@ func (p *CopilotProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.Head
 	}
 	resp := p.sendCopilotNonStream(ctx, modifiedBody)
 	resp.ModelName = modelName
-		resp.ConvertResponseFormat = "anthropic"
+	resp.ConvertResponseFormat = "anthropic"
 	return resp
 }
 
@@ -372,6 +372,12 @@ func (p *CopilotProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context
 }
 
 // handleCopilotNonStreamingResponse 处理 Copilot 非流式响应
+// HandleCodexFormat 不支持 Codex 格式
+func (p *CopilotProxy) HandleCodexFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
+	return fmt.Errorf("codex format not supported by Copilot provider: %s", p.provider.Name), 0
+}
+
+// handleCopilotNonStreamingResponse 处理 Copilot 非流式响应
 func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) error {
 	// 获取 Copilot token
 	copilotToken := RefreshCopilotToken(p.provider)
@@ -438,27 +444,27 @@ func (p *CopilotProxy) handleCopilotNonStreamingResponse(ctx context.Context, c 
 
 	// 记录 history（记录转换后的响应）
 	history.AddRecord(history.RequestRecord{
-		ID:           requestID,
-		Timestamp:    startTime,
-		Method:       method,
-		Path:         path,
-		ClientIP:     clientIP,
-		KeyID:        keyID,
-		Provider:     p.provider.Name,
-		Model:        modelName,
-		StatusCode:   resp.StatusCode,
-		Duration:     duration,
-		RequestBody:  requestBody,
-		ResponseBody: string(anthropicResp),
-		RequestHeaders: c.Request.Header,
-		ResponseHeaders: resp.Header,
-		RequestSize:  int64(len(requestBody)),
-		ResponseSize: int64(len(anthropicResp)),
+		ID:                   requestID,
+		Timestamp:            startTime,
+		Method:               method,
+		Path:                 path,
+		ClientIP:             clientIP,
+		KeyID:                keyID,
+		Provider:             p.provider.Name,
+		Model:                modelName,
+		StatusCode:           resp.StatusCode,
+		Duration:             duration,
+		RequestBody:          requestBody,
+		ResponseBody:         string(anthropicResp),
+		RequestHeaders:       c.Request.Header,
+		ResponseHeaders:      resp.Header,
+		RequestSize:          int64(len(requestBody)),
+		ResponseSize:         int64(len(anthropicResp)),
 		InputTokens:          inputTokens,
 		OutputTokens:         outputTokens,
 		CacheReadInputTokens: cacheReadTokens,
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
-		Cost:         cost,
+		Cost:                 cost,
 	})
 
 	return nil
@@ -570,27 +576,27 @@ func (p *CopilotProxy) handleCopilotStreamingResponse(ctx context.Context, c *gi
 	// 记录 history（记录转换后的响应）
 	// 注意：这里没有收集完整的流式响应体，因为转换后的响应大小可能很大
 	history.AddRecord(history.RequestRecord{
-		ID:           requestID,
-		Timestamp:    startTime,
-		Method:       method,
-		Path:         path,
-		ClientIP:     clientIP,
-		KeyID:        keyID,
-		Provider:     p.provider.Name,
-		Model:        modelName,
-		StatusCode:   200, // 流式响应假设成功
-		Duration:     duration,
-		RequestBody:  requestBody,
-		ResponseBody: "(streaming response not logged)",
-		RequestHeaders: c.Request.Header,
-		ResponseHeaders: nil, // 流式响应头已经在上面设置过了
-		RequestSize:  int64(len(requestBody)),
-		ResponseSize: 0,
+		ID:                   requestID,
+		Timestamp:            startTime,
+		Method:               method,
+		Path:                 path,
+		ClientIP:             clientIP,
+		KeyID:                keyID,
+		Provider:             p.provider.Name,
+		Model:                modelName,
+		StatusCode:           200, // 流式响应假设成功
+		Duration:             duration,
+		RequestBody:          requestBody,
+		ResponseBody:         "(streaming response not logged)",
+		RequestHeaders:       c.Request.Header,
+		ResponseHeaders:      nil, // 流式响应头已经在上面设置过了
+		RequestSize:          int64(len(requestBody)),
+		ResponseSize:         0,
 		InputTokens:          inputTokens,
 		OutputTokens:         outputTokens,
 		CacheReadInputTokens: cacheReadTokens,
 		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
-		Cost:         cost,
+		Cost:                 cost,
 	})
 
 	return nil

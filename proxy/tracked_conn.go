@@ -156,7 +156,7 @@ func (t *ConnectionTracker) OnAccept(conn net.Conn, protocol string, isTLS bool)
 	clientHash := hashClientRemote(conn.RemoteAddr().String())
 	info.SetClientHash(clientHash)
 
-	provider := config.GetConfig().GetClientHashedProvider(clientHash, 0)
+	provider := config.GetConfig().GetOpenaiProvider(clientHash, 0)
 	if provider != nil {
 		info.SetProvider(provider)
 		info.SetProviderIdx(0)
@@ -202,7 +202,7 @@ func (t *ConnectionTracker) GetConnProvider(connID string, attempt int) *config.
 			return connInfo.Provider()
 		}
 		// 尝试切换到下一个 provider
-		newProvider := config.GetConfig().GetClientHashedProvider(connInfo.ClientHash(), attempt)
+		newProvider := config.GetConfig().GetOpenaiProvider(connInfo.ClientHash(), attempt)
 		if newProvider != nil {
 			connInfo.SetProvider(newProvider)
 			connInfo.SetProviderIdx(attempt)
@@ -211,7 +211,7 @@ func (t *ConnectionTracker) GetConnProvider(connID string, attempt int) *config.
 		}
 		return newProvider
 	}
-	return config.GetConfig().GetClientHashedProvider(0, attempt)
+	return config.GetConfig().GetOpenaiProvider(0, attempt)
 }
 
 // UpdateConnProvider 更新连接的 Provider 绑定（用于故障切换后）

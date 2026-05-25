@@ -222,6 +222,11 @@ func (p *AnthropicProxy) HandleOpenAIFormat(ctx context.Context, c *gin.Context,
 	return p.handleAnthropicNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
 }
 
+// HandleCodexFormat 不支持 Codex 格式
+func (p *AnthropicProxy) HandleCodexFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
+	return fmt.Errorf("codex format not supported by Anthropic provider: %s", p.provider.Name), 0
+}
+
 // Close 释放资源
 func (p *AnthropicProxy) Close() error {
 	p.client.CloseIdleConnections()
@@ -528,8 +533,8 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		logger.Error("api error | status=%d req %s resp=%s", resp.StatusCode, string(reqBody), string(respBytes))
-		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))), resp.StatusCode
+		logger.Error("none stream status=%d req=%s resp=%s", resp.StatusCode, string(reqBody), string(respBytes))
+		return NewProxyErrorWithBody(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d", modelName, p.provider.Name, resp.StatusCode), respBytes), resp.StatusCode
 	}
 
 	// 解析 token 统计
@@ -593,7 +598,8 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 				strings.ToLower(k) == "content-type" ||
 				strings.ToLower(k) == "user-agent" ||
 				strings.ToLower(k) == "anthropic-beta" ||
-				strings.ToLower(k) == "x-app" {
+				strings.ToLower(k) == "x-app" ||
+				strings.ToLower(k) == "x-api-key" {
 				continue
 			}
 			req.Header.Add(k, val)
@@ -608,13 +614,14 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request: %w; %s:%s", err, modelName, p.provider.Name), 0
+		return fmt.Errorf("send request: %w; model:%s provider:%s", err, modelName, p.provider.Name), 0
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body)), resp.StatusCode
+		logger.Error("stream error: code %d req=%s resp=%s", resp.StatusCode, string(reqBody), string(body))
+		return NewProxyErrorWithBody(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d", modelName, p.provider.Name, resp.StatusCode), body), resp.StatusCode
 	}
 
 	// 设置流式响应头

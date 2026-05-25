@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,10 +13,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// ProxyError 代理错误，携带 HTTP 状态码
+// ProxyError 代理错误，携带 HTTP 状态码和原始响应体
 type ProxyError struct {
 	StatusCode int // 0 表示无法获取状态码
 	Err        error
+	Body       []byte // 上游返回的原始错误响应体
 }
 
 func (e *ProxyError) Error() string {
@@ -37,6 +37,14 @@ func NewProxyError(statusCode int, err error) error {
 		return nil
 	}
 	return &ProxyError{StatusCode: statusCode, Err: err}
+}
+
+// NewProxyErrorWithBody 创建带有响应体的代理错误
+func NewProxyErrorWithBody(statusCode int, err error, body []byte) error {
+	if err == nil {
+		return nil
+	}
+	return &ProxyError{StatusCode: statusCode, Err: err, Body: body}
 }
 
 // GetStatusCode 从错误中提取状态码
@@ -76,6 +84,7 @@ var NonRetryableStatuses = map[int]bool{
 // RetryableStatuses 默认可重试的状态码（不在 NonRetryableStatuses 中的）
 // 包括：认证错误(401/403)、配额限制(429)、服务端错误(5xx)
 var RetryableStatuses = map[int]bool{
+	0:   true, // 无法获取状态码，可能是网络错误等，默认认为可重试
 	401: true, // Unauthorized - key可能失效
 	403: true, // Forbidden - 权限问题，换key可能成功
 	404: true, // Not Found - 模型可能不存在
@@ -106,140 +115,157 @@ func truncateError(msg string) string {
 	return msg
 }
 
-// baseProxyHandlerWithCcProxy 使用 CcProxy 接口的代理处理逻辑
-// 优化：Handler 只负责认证和传递原始请求，所有转换由 Proxy 内部处理
-func baseProxyHandlerWithCcProxy(c *gin.Context, cfg *handlerConfig) {
-	requestID := uuid.New().String()
+// errorResponse 用于保存上游返回的错误响应
+type errorResponse struct {
+	StatusCode int
+	Body       []byte
+}
 
-	// 1. 认证
-	keyID, clientIP, ok := authenticate(c)
-	if !ok {
+// writeErrorResponse 将上游错误响应写入客户端
+// 根据请求格式（OpenAI/Anthropic）决定返回格式
+func writeErrorResponse(c *gin.Context, errResp *errorResponse, isIncomingOpenAIFormat bool) {
+	if errResp == nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Unknown error"})
 		return
 	}
 
-	// 2. 获取或创建连接级别的 CcProxy entry
-	mgr := GetGlobalConnProxyManager()
-	entry, err := mgr.GetOrCreate(c.Request.RemoteAddr, nil)
+	// 设置响应头
+	c.Header("Content-Type", "application/json")
+
+	// 如果响应体为空或解析失败，构造一个简单的错误响应
+	if len(errResp.Body) == 0 {
+		if isIncomingOpenAIFormat {
+			c.JSON(errResp.StatusCode, gin.H{
+				"error": gin.H{
+					"message": fmt.Sprintf("Request failed with status %d", errResp.StatusCode),
+					"type":    "api_error",
+				},
+			})
+		} else {
+			c.JSON(errResp.StatusCode, gin.H{
+				"type":  "error",
+				"error": gin.H{"type": "api_error", "message": fmt.Sprintf("Request failed with status %d", errResp.StatusCode)},
+			})
+		}
+		return
+	}
+
+	// 尝试解析上游响应，确保格式正确
+	var upstreamErr map[string]interface{}
+	if json.Unmarshal(errResp.Body, &upstreamErr) == nil {
+		// 上游响应是有效 JSON，直接转发
+		c.Data(errResp.StatusCode, "application/json", errResp.Body)
+	} else {
+		// 上游响应不是有效 JSON，构造标准错误响应
+		if isIncomingOpenAIFormat {
+			c.JSON(errResp.StatusCode, gin.H{
+				"error": gin.H{
+					"message": string(errResp.Body),
+					"type":    "api_error",
+				},
+			})
+		} else {
+			c.JSON(errResp.StatusCode, gin.H{
+				"type":  "error",
+				"error": gin.H{"type": "api_error", "message": string(errResp.Body)},
+			})
+		}
+	}
+}
+
+// extractErrorResponseBody 从错误中提取响应体和状态码
+func extractErrorResponseBody(err error) (statusCode int, body []byte) {
+	if err == nil {
+		return 0, nil
+	}
+	if proxyErr, ok := err.(*ProxyError); ok {
+		return proxyErr.StatusCode, proxyErr.Body
+	}
+	return 0, nil
+}
+
+// handlerSetup 存储 handler 初始化的公共上下文
+type handlerSetup struct {
+	requestID string
+	entry     *ConnProxyEntry
+	mgr       *ConnProxyManager
+	bodyBytes []byte
+	ok        bool
+}
+
+// setupHandler 执行 handler 公共初始化：认证、获取 proxy、读取 body
+func setupHandler(c *gin.Context, providerType string) *handlerSetup {
+	s := &handlerSetup{}
+	s.requestID = uuid.New().String()
+
+	keyID, clientIP, ok := authenticate(c)
+	if !ok {
+		logger.Warn("Authentication failed for client IP %s", c.ClientIP())
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Authentication failed"})
+		return s
+	}
+
+	s.mgr = GetGlobalConnProxyManager()
+	var err error
+	s.entry, err = s.mgr.GetOrCreate(c.Request.RemoteAddr, providerType)
 	if err != nil {
 		logger.Error("Failed to get or create CcProxy: %v", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Failed to initialize proxy"})
-		return
+		return s
 	}
 
-	// 3. 读取原始请求体（不做任何修改）
-	bodyBytes, err := io.ReadAll(c.Request.Body)
+	s.bodyBytes, err = io.ReadAll(c.Request.Body)
 	if err != nil {
 		logger.Error("Failed to read request body: %v", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
-		return
+		return s
 	}
 
-	// 4. 根据请求格式选择调用方式（传递原始请求头和请求体）
-	// HandleXxxFormat 内部处理：模型映射、格式转换、发送请求、响应转发、统计记录
-	// 将认证信息和请求ID存储到 gin.Context 中，供 Proxy 方法读取
 	c.Set("keyID", keyID)
 	c.Set("clientIP", clientIP)
-	c.Set("request_id", requestID)
+	c.Set("request_id", s.requestID)
+	s.ok = true
+	return s
+}
 
-	ctx := context.Background()
-	if cfg.isIncomingOpenAIFormat {
-		err, statusCode := entry.Proxy.HandleOpenAIFormat(ctx, c, c.Request.Header, bodyBytes)
-		if err != nil {
-			// 如果仍然为 0，说明无法确定错误类型，不切换 provider
-			if statusCode == 0 {
-				logger.Error("[Error] provider=%s model=OpenAI status=unknown error=%s",
-					entry.Proxy.Provider().Name, truncateError(err.Error()))
-				c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
+// handleError 处理代理调用错误，包含故障切换重试逻辑
+func handleError(c *gin.Context, s *handlerSetup, providerType string, err error, statusCode int, modelName string, isOpenAIFormat bool, retry func(newEntry *ConnProxyEntry) (error, int)) {
+	isRetryable := ClassifyError(statusCode) == ClassificationRetryable
+	logger.Error("[Error] provider=%s model=%s status=%d classification=%s error=%s",
+		s.entry.Proxy.Provider().Name, modelName, statusCode,
+		map[bool]string{true: "retryable", false: "non-retryable"}[isRetryable],
+		truncateError(err.Error()))
+
+	errStatusCode, errBody := extractErrorResponseBody(err)
+	if errStatusCode == 0 {
+		errStatusCode = statusCode
+	}
+
+	if isRetryable {
+		newEntry, switchErr := s.mgr.SwitchProvider(c.Request.RemoteAddr, providerType, s.entry.providerIdx+1)
+		if switchErr == nil {
+			retryErr, retryStatusCode := retry(newEntry)
+			if retryErr == nil {
 				return
 			}
-
-			isRetryable := ClassifyError(statusCode) == ClassificationRetryable
-			logger.Error("[Error] provider=%s model=OpenAI status=%d classification=%s error=%s",
-				entry.Proxy.Provider().Name, statusCode,
-				map[bool]string{true: "retryable", false: "non-retryable"}[isRetryable],
-				truncateError(err.Error()))
-
-			if isRetryable {
-				newEntry, switchErr := mgr.SwitchProvider(c.Request.RemoteAddr, entry.providerIdx+1)
-				if switchErr == nil {
-					retryErr, retryStatusCode := newEntry.Proxy.HandleOpenAIFormat(ctx, c, c.Request.Header, bodyBytes)
-					if retryErr == nil {
-						return
-					} else {
-						if retryStatusCode == 0 {
-							logger.Error("[SwitchProvider] retry status unknown, not switching: %s", truncateError(retryErr.Error()))
-							mgr.Remove(c.Request.RemoteAddr)
-						} else {
-							retryIsRetryable := ClassifyError(retryStatusCode) == ClassificationRetryable
-							logger.Error("[SwitchProvider] retry failed status=%d classification=%s error=%s",
-								retryStatusCode,
-								map[bool]string{true: "retryable", false: "non-retryable"}[retryIsRetryable],
-								truncateError(retryErr.Error()))
-							if !retryIsRetryable {
-								mgr.Remove(c.Request.RemoteAddr)
-							}
-						}
-					}
-				} else {
-					logger.Error("[SwitchProvider] failed to switch: %s", switchErr.Error())
-					mgr.Remove(c.Request.RemoteAddr)
-				}
+			retryIsRetryable := ClassifyError(retryStatusCode) == ClassificationRetryable
+			logger.Error("[SwitchProvider] retry failed status=%d classification=%s error=%s",
+				retryStatusCode,
+				map[bool]string{true: "retryable", false: "non-retryable"}[retryIsRetryable],
+				truncateError(retryErr.Error()))
+			if !retryIsRetryable {
+				s.mgr.Remove(c.Request.RemoteAddr)
 			}
-			c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
-		}
-	} else {
-		err, statusCode := entry.Proxy.HandleAnthropicFormat(ctx, c, c.Request.Header, bodyBytes)
-		if err != nil {
-			// 如果 proxy 返回的状态码为 0，尝试从错误中提取
-			if statusCode == 0 {
-				statusCode = GetStatusCode(err)
+			retryStatusCode2, retryBody := extractErrorResponseBody(retryErr)
+			if retryStatusCode2 > 0 {
+				errStatusCode, errBody = retryStatusCode2, retryBody
 			}
-			// 如果仍然为 0，说明无法确定错误类型，不切换 provider
-			if statusCode == 0 {
-				logger.Error("[Error] provider=%s model=Anthropic status=unknown error=%s",
-					entry.Proxy.Provider().Name, truncateError(err.Error()))
-				c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
-				return
-			}
-
-			isRetryable := ClassifyError(statusCode) == ClassificationRetryable
-			logger.Error("[Error] provider=%s model=Anthropic status=%d classification=%s error=%s",
-				entry.Proxy.Provider().Name, statusCode,
-				map[bool]string{true: "retryable", false: "non-retryable"}[isRetryable],
-				truncateError(err.Error()))
-
-			if isRetryable {
-				newEntry, switchErr := mgr.SwitchProvider(c.Request.RemoteAddr, entry.providerIdx+1)
-				if switchErr == nil {
-					retryErr, retryStatusCode := newEntry.Proxy.HandleAnthropicFormat(ctx, c, c.Request.Header, bodyBytes)
-					if retryErr == nil {
-						return
-					} else {
-						if retryStatusCode == 0 {
-							retryStatusCode = GetStatusCode(retryErr)
-						}
-						if retryStatusCode == 0 {
-							logger.Error("[SwitchProvider] retry status unknown, not switching: %s", truncateError(retryErr.Error()))
-							mgr.Remove(c.Request.RemoteAddr)
-						} else {
-							retryIsRetryable := ClassifyError(retryStatusCode) == ClassificationRetryable
-							logger.Error("[SwitchProvider] retry failed status=%d classification=%s error=%s",
-								retryStatusCode,
-								map[bool]string{true: "retryable", false: "non-retryable"}[retryIsRetryable],
-								truncateError(retryErr.Error()))
-							if !retryIsRetryable {
-								mgr.Remove(c.Request.RemoteAddr)
-							}
-						}
-					}
-				} else {
-					logger.Error("[SwitchProvider] failed to switch: %s", switchErr.Error())
-					mgr.Remove(c.Request.RemoteAddr)
-				}
-			}
-			c.JSON(http.StatusBadGateway, gin.H{"error": "Request failed: " + err.Error()})
+		} else {
+			logger.Error("[SwitchProvider] failed to switch: %s", switchErr.Error())
+			s.mgr.Remove(c.Request.RemoteAddr)
 		}
 	}
+	writeErrorResponse(c, &errorResponse{StatusCode: errStatusCode, Body: errBody}, isOpenAIFormat)
 }
 
 // GetAuthInfo 从 gin.Context 中获取认证信息

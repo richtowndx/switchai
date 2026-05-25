@@ -431,19 +431,64 @@ func (c *Config) GetProviderByID(id string) *Provider {
 	return nil
 }
 
-// GetClientHashedProvider 根据客户端 hash 值从所有活跃 provider 中选取 provider。
-// attempt 为重试偏移量，相同 hash 不同 attempt 可命中不同 provider，避免重试始终打到同一个。
-// 格式转换由调用方（processRequestBody）负责，此处不做格式过滤。
-func (c *Config) GetClientHashedProvider(hash uint64, attempt int) *Provider {
+// GetAnthropicProvider 从所有非 OpenAI 格式的 provider 中选取一个（anthropic 类型）。
+// 排除 Copilot 类型的 provider。attempt 用于重试偏移，相同 hash 不同 attempt 可命中不同 provider。
+func (c *Config) GetAnthropicProvider(hash uint64, attempt int) *Provider {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if len(c.Providers) == 0 {
+	var matching []*Provider
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if !p.IsOpenAIFormat && !p.IsCopilot() {
+			matching = append(matching, p)
+		}
+	}
+	if len(matching) == 0 {
 		return nil
 	}
+	idx := (hash + uint64(attempt)) % uint64(len(matching))
+	return matching[idx]
+}
 
-	idx := (hash + uint64(attempt)) % uint64(len(c.Providers))
-	return &c.Providers[idx]
+// GetOpenaiProvider 从所有 OpenAI 格式的 provider 中选取一个。
+// 排除 Copilot 类型的 provider。attempt 用于重试偏移。
+func (c *Config) GetOpenaiProvider(hash uint64, attempt int) *Provider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var matching []*Provider
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if p.IsOpenAIFormat && !p.IsCopilot() {
+			matching = append(matching, p)
+		}
+	}
+	if len(matching) == 0 {
+		return nil
+	}
+	idx := (hash + uint64(attempt)) % uint64(len(matching))
+	return matching[idx]
+}
+
+// GetCopilotProvider 从所有 Copilot 类型的 provider 中选取一个。
+// attempt 用于重试偏移。
+func (c *Config) GetCopilotProvider(hash uint64, attempt int) *Provider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	var matching []*Provider
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		if p.IsCopilot() {
+			matching = append(matching, p)
+		}
+	}
+	if len(matching) == 0 {
+		return nil
+	}
+	idx := (hash + uint64(attempt)) % uint64(len(matching))
+	return matching[idx]
 }
 
 // round-robin 轮询计数器

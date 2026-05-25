@@ -314,13 +314,10 @@ func (p *OpenAIProxy) sendOpenAIStream(ctx context.Context, reqBody []byte) *Pro
 func (p *OpenAIProxy) buildURL() string {
 	baseURL := p.provider.BaseURL
 	if !strings.HasSuffix(baseURL, "/chat/completions") {
-		if !strings.HasSuffix(baseURL, "/v1") && !strings.HasSuffix(baseURL, "/v1/") {
-			if !strings.HasSuffix(baseURL, "/") {
-				baseURL += "/"
-			}
-			baseURL += "v1"
+		if !strings.HasSuffix(baseURL, "/") {
+			baseURL += "/"
 		}
-		baseURL += "/chat/completions"
+		baseURL += "chat/completions"
 	}
 	return baseURL
 }
@@ -377,6 +374,240 @@ func (p *OpenAIProxy) HandleAnthropicFormat(ctx context.Context, c *gin.Context,
 	return p.handleOpenAINonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
 }
 
+// handleOpenAIStreamingResponse
+// HandleCodexFormat 处理 Codex/Responses API 格式请求
+func (p *OpenAIProxy) HandleCodexFormat(ctx context.Context, c *gin.Context, reqHdr http.Header, reqBody []byte) (error, int) {
+	startTime := time.Now()
+	var firstTokenTime time.Time
+
+	requestID := c.GetHeader("X-Request-ID")
+	if requestID == "" {
+		requestID = c.GetString("request_id")
+	}
+	method := "POST"
+	path := "/chat/completions"
+
+	modifiedBody, modelName, isStream := p.parseAndProcessCodexRequest(reqBody)
+
+	if isStream {
+		return p.handleCodexStreamingResponse(ctx, c, modifiedBody, modelName, startTime, &firstTokenTime, requestID, method, path, string(reqBody))
+	}
+
+	return p.handleCodexNonStreamingResponse(ctx, c, modifiedBody, modelName, startTime, requestID, method, path, string(reqBody))
+}
+
+// parseAndProcessCodexRequest 解析 Codex → Chat Completions + 模型映射 + stream 检查
+func (p *OpenAIProxy) parseAndProcessCodexRequest(reqBody []byte) ([]byte, string, bool) {
+	var req map[string]interface{}
+	if err := json.Unmarshal(reqBody, &req); err != nil {
+		return reqBody, "", false
+	}
+
+	// If the request is already in Chat format (has top-level messages, no input),
+	// skip Codex-to-Chat conversion — just do model mapping + stream detection.
+	if _, hasInput := req["input"]; !hasInput {
+		if _, hasMessages := req["messages"]; hasMessages {
+			return p.parseAndProcessRequest(reqBody)
+		}
+	}
+
+	chatBody := convertCodexToChat(req, p.provider)
+
+	modelName, _ := chatBody["model"].(string)
+
+	isStream := false
+	if v, ok := chatBody["stream"].(bool); ok {
+		isStream = v
+	}
+
+	result, _ := json.Marshal(chatBody)
+	return result, modelName, isStream
+}
+
+// handleCodexNonStreamingResponse 处理 Codex 非流式响应
+func (p *OpenAIProxy) handleCodexNonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) (error, int) {
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := readResponseBody(resp)
+	if err != nil {
+		return fmt.Errorf("read body | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		logger.Error("no stream status code %d | model:%s provider:%s | req_body_size=%d resp=%s", resp.StatusCode, modelName, p.provider.Name, len(reqBody), truncateError(string(respBytes)))
+		return NewProxyErrorWithBody(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes)), respBytes), resp.StatusCode
+	}
+
+	// Convert Chat response to Codex format
+	codexResp := convertChatToCodex(respBytes)
+
+	_, inputTokens, outputTokens, cacheReadTokens := parseTokenStats(respBytes)
+
+	c.Header("Content-Type", "application/json")
+	c.Data(200, "application/json", codexResp)
+
+	duration := time.Since(startTime).Milliseconds()
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
+
+	keyID, clientIP := GetAuthInfo(c)
+	if clientIP == "" {
+		clientIP = c.ClientIP()
+	}
+
+	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "non-stream", "ccproxy",
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, 0, keyID, clientIP)
+
+	history.AddRecord(history.RequestRecord{
+		ID:                   requestID,
+		Timestamp:            startTime,
+		Method:               method,
+		Path:                 path,
+		ClientIP:             clientIP,
+		KeyID:                keyID,
+		Provider:             p.provider.Name,
+		Model:                modelName,
+		StatusCode:           resp.StatusCode,
+		Duration:             duration,
+		RequestBody:          requestBody,
+		ResponseBody:         string(respBytes),
+		RequestHeaders:       c.Request.Header,
+		ResponseHeaders:      resp.Header,
+		RequestSize:          int64(len(requestBody)),
+		ResponseSize:         int64(len(respBytes)),
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
+		Cost:                 cost,
+	})
+	return nil, 0
+}
+
+// handleCodexStreamingResponse 处理 Codex 流式响应
+func (p *OpenAIProxy) handleCodexStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) (error, int) {
+	baseURL := p.buildURL()
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		logger.Error("status code %d | model:%s provider:%s | req_body_size=%d resp=%s", resp.StatusCode, modelName, p.provider.Name, len(reqBody), truncateError(string(body)))
+		return NewProxyErrorWithBody(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body)), body), resp.StatusCode
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming not supported | model:%s provider:%s", modelName, p.provider.Name), 0
+	}
+
+	converter := newCodexStreamConverter()
+	var inputTokens, outputTokens, cacheReadTokens int
+	var responseBody strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	buf := scannerBufferPool.Get().([]byte)
+	defer func() { scannerBufferPool.Put(buf) }()
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if firstTokenTime.IsZero() {
+			*firstTokenTime = time.Now()
+		}
+
+		// Convert Chat SSE line to Codex SSE events
+		events := converter.ConvertLine(line)
+		for _, event := range events {
+			c.Writer.WriteString(event)
+			flusher.Flush()
+
+			if responseBody.Len() < 100*1024 {
+				responseBody.WriteString(event)
+			}
+		}
+
+		// Extract token stats from the original line
+		inputTokens, outputTokens, cacheReadTokens = extractTokensFromSSE(line, inputTokens, outputTokens, cacheReadTokens)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan stream | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
+	}
+
+	duration := time.Since(startTime).Milliseconds()
+	var timeToFirst int64
+	if firstTokenTime != nil && !firstTokenTime.IsZero() {
+		timeToFirst = firstTokenTime.Sub(startTime).Milliseconds()
+	}
+	cost := calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens)
+
+	keyID, clientIP := GetAuthInfo(c)
+	if clientIP == "" {
+		clientIP = c.ClientIP()
+	}
+
+	stats.RecordUsage(p.provider.ID, p.provider.Name, modelName, "stream", "ccproxy",
+		inputTokens, outputTokens, cacheReadTokens, cost, duration, timeToFirst, keyID, clientIP)
+
+	responseBodyStr := responseBody.String()
+	if responseBody.Len() >= 100*1024 {
+		responseBodyStr += "\n... (truncated)"
+	}
+
+	history.AddRecord(history.RequestRecord{
+		ID:                   requestID,
+		Timestamp:            startTime,
+		Method:               method,
+		Path:                 path,
+		ClientIP:             clientIP,
+		KeyID:                keyID,
+		Provider:             p.provider.Name,
+		Model:                modelName,
+		StatusCode:           resp.StatusCode,
+		Duration:             duration,
+		RequestBody:          requestBody,
+		ResponseBody:         responseBodyStr,
+		RequestHeaders:       c.Request.Header,
+		ResponseHeaders:      resp.Header,
+		RequestSize:          int64(len(requestBody)),
+		ResponseSize:         int64(responseBody.Len()),
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CacheReadInputTokens: cacheReadTokens,
+		TotalTokens:          inputTokens + outputTokens + cacheReadTokens,
+		Cost:                 cost,
+	})
+	return nil, 0
+}
+
 // handleOpenAIStreamingResponse 处理流式响应
 func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, firstTokenTime *time.Time, requestID, method, path, requestBody string) (error, int) {
 	baseURL := p.buildURL()
@@ -398,7 +629,7 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body))), resp.StatusCode
+		return NewProxyErrorWithBody(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(body)), body), resp.StatusCode
 	}
 
 	// 设置流式响应头
@@ -518,7 +749,7 @@ func (p *OpenAIProxy) handleOpenAINonStreamingResponse(ctx context.Context, c *g
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return NewProxyError(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes))), resp.StatusCode
+		return NewProxyErrorWithBody(resp.StatusCode, fmt.Errorf("api error | model:%s provider:%s | status %d body: %s", modelName, p.provider.Name, resp.StatusCode, string(respBytes)), respBytes), resp.StatusCode
 	}
 
 	// 解析 token 统计

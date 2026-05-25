@@ -45,9 +45,6 @@ type ConnProxyEntry struct {
 	// RequestCount 请求计数
 	RequestCount int64
 
-	// clientHash 客户端 hash（用于 provider 选择）
-	clientHash uint64
-
 	// providerIdx provider 索引（用于故障切换）
 	providerIdx int
 }
@@ -67,8 +64,8 @@ func NewConnProxyManager() *ConnProxyManager {
 
 // GetOrCreate 获取或创建连接级别的 CcProxy
 // remoteAddr: 客户端地址（IP:PORT）
-// provider: 优先使用的 provider（如果为 nil，则使用 hash 选择）
-func (m *ConnProxyManager) GetOrCreate(remoteAddr string, preferredProvider *config.Provider) (*ConnProxyEntry, error) {
+// providerType: provider 类型（"openai" / "anthropic"），用于选择对应类型的 provider
+func (m *ConnProxyManager) GetOrCreate(remoteAddr string, providerType string) (*ConnProxyEntry, error) {
 	// 尝试加载现有代理
 	if val, ok := m.proxies.Load(remoteAddr); ok {
 		entry := val.(*ConnProxyEntry)
@@ -79,22 +76,10 @@ func (m *ConnProxyManager) GetOrCreate(remoteAddr string, preferredProvider *con
 		return entry, nil
 	}
 
-	// 确定要使用的 provider
-	var provider *config.Provider
-	var clientHash uint64
-	var providerIdx int
-
-	if preferredProvider != nil {
-		provider = preferredProvider
-		clientHash = hashClientRemote(remoteAddr)
-		providerIdx = 0
-	} else {
-		// 基于 hash 选择 provider
-		clientHash = hashClientRemote(remoteAddr)
-		provider = config.GetConfig().GetClientHashedProvider(m.seqid, 0)
-		providerIdx = 0
-		m.seqid++
-	}
+	// 根据类型选择 provider
+	provider := m.getProviderByType(providerType)
+	providerIdx := 0
+	m.seqid++
 
 	if provider == nil {
 		return nil, fmt.Errorf("no provider available for client %s", remoteAddr)
@@ -114,7 +99,6 @@ func (m *ConnProxyManager) GetOrCreate(remoteAddr string, preferredProvider *con
 		CreatedAt:    time.Now(),
 		LastUsedAt:   time.Now(),
 		RequestCount: 1,
-		clientHash:   clientHash,
 		providerIdx:  providerIdx,
 	}
 
@@ -160,20 +144,34 @@ func (m *ConnProxyManager) Get(remoteAddr string) (*ConnProxyEntry, bool) {
 	return nil, false
 }
 
+// getProviderByType 根据 providerType 从 Config 中获取对应类型的 provider。
+func (m *ConnProxyManager) getProviderByType(providerType string) *config.Provider {
+	switch providerType {
+	case "anthropic":
+		return config.GetConfig().GetAnthropicProvider(m.seqid, 0)
+	case "openai":
+		return config.GetConfig().GetOpenaiProvider(m.seqid, 0)
+	case "copilot":
+		return config.GetConfig().GetCopilotProvider(m.seqid, 0)
+	default:
+		return config.GetConfig().GetOpenaiProvider(m.seqid, 0)
+	}
+}
+
 // SwitchProvider 切换连接的 provider（用于故障切换）
-func (m *ConnProxyManager) SwitchProvider(remoteAddr string, attempt int) (*ConnProxyEntry, error) {
+func (m *ConnProxyManager) SwitchProvider(remoteAddr string, providerType string, attempt int) (*ConnProxyEntry, error) {
 	// 先移除旧的 proxy
 	_ = m.Remove(remoteAddr)
 
 	// 获取新的 provider
-	clientHash := hashClientRemote(remoteAddr)
-	newProvider := config.GetConfig().GetClientHashedProvider(clientHash, attempt)
+	newProvider := m.getProviderByType(providerType)
 	if newProvider == nil {
-		return nil, fmt.Errorf("no provider available for attempt %d", attempt)
+		return nil, fmt.Errorf("no provider available for type %s attempt %d", providerType, attempt)
 	}
+	m.seqid++
 
 	// 创建新的 entry
-	return m.GetOrCreate(remoteAddr, newProvider)
+	return m.GetOrCreate(remoteAddr, providerType)
 }
 
 // cleanupLoop 清理空闲连接的协程

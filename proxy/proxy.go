@@ -6,6 +6,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"context"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -17,6 +18,7 @@ import (
 	"switchai/history"
 	"switchai/logger"
 	"switchai/stats"
+
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -38,6 +40,10 @@ func RegisterRoutes(r *gin.Engine) {
 	// Copilot 专用路由 (不含 /v1 前缀)
 	r.POST("/chat/completions", copilotHandler)
 	r.Any("/copilot/*path", copilotHandler)
+
+	// Codex/Responses API 路由
+	r.POST("/responses", codexHandler)
+	r.POST("/v1/responses", codexHandler)
 }
 
 // ============================================================
@@ -295,45 +301,70 @@ func hashClientRemote(remoteAddr string) uint64 {
 }
 
 // ============================================================
-// Handler 配置
-// ============================================================
-
-// handlerConfig 封装 handler 的格式配置
-type handlerConfig struct {
-	isIncomingOpenAIFormat bool   // 请求是否为 OpenAI 格式
-	isCopilot              bool   // 是否为 Copilot 处理器
-	formatName             string // 格式名称（用于日志）
-}
-
-// ============================================================
 // 主入口：特定格式的 Proxy Handler
 // ============================================================
 
 // openAIHandler 处理 OpenAI 格式的请求
 func openAIHandler(c *gin.Context) {
-	baseProxyHandlerWithCcProxy(c, &handlerConfig{
-		isIncomingOpenAIFormat: true,
-		isCopilot:              false,
-		formatName:             "OpenAI",
-	})
+	s := setupHandler(c, "openai")
+	if !s.ok {
+		return
+	}
+
+	err, statusCode := s.entry.Proxy.HandleOpenAIFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+	if err != nil {
+		handleError(c, s, "openai", err, statusCode, "OpenAI", true,
+			func(newEntry *ConnProxyEntry) (error, int) {
+				return newEntry.Proxy.HandleOpenAIFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+			})
+	}
 }
 
 // anthropicHandler 处理 Anthropic/Claude 格式的请求
 func anthropicHandler(c *gin.Context) {
-	baseProxyHandlerWithCcProxy(c, &handlerConfig{
-		isIncomingOpenAIFormat: false,
-		isCopilot:              false,
-		formatName:             "Anthropic",
-	})
+	s := setupHandler(c, "anthropic")
+	if !s.ok {
+		return
+	}
+
+	err, statusCode := s.entry.Proxy.HandleAnthropicFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+	if err != nil {
+		handleError(c, s, "anthropic", err, statusCode, "Anthropic", false,
+			func(newEntry *ConnProxyEntry) (error, int) {
+				return newEntry.Proxy.HandleAnthropicFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+			})
+	}
 }
 
 // copilotHandler 处理 Copilot 格式的请求
 func copilotHandler(c *gin.Context) {
-	baseProxyHandlerWithCcProxy(c, &handlerConfig{
-		isIncomingOpenAIFormat: false, // Copilot 使用类 Anthropic 格式
-		isCopilot:              true,
-		formatName:             "Copilot",
-	})
+	s := setupHandler(c, "copilot")
+	if !s.ok {
+		return
+	}
+
+	err, statusCode := s.entry.Proxy.HandleAnthropicFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+	if err != nil {
+		handleError(c, s, "copilot", err, statusCode, "Copilot", false,
+			func(newEntry *ConnProxyEntry) (error, int) {
+				return newEntry.Proxy.HandleAnthropicFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+			})
+	}
+}
+
+// codexHandler 处理 Codex/Responses API 格式的请求
+func codexHandler(c *gin.Context) {
+	s := setupHandler(c, "openai")
+	if !s.ok {
+		return
+	}
+	err, statusCode := s.entry.Proxy.HandleCodexFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+	if err != nil {
+		handleError(c, s, "openai", err, statusCode, "Codex", true,
+			func(newEntry *ConnProxyEntry) (error, int) {
+				return newEntry.Proxy.HandleCodexFormat(context.Background(), c, c.Request.Header, s.bodyBytes)
+			})
+	}
 }
 
 // ============================================================
@@ -473,8 +504,8 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 					// Distinguish Anthropic SSE event types
 					if eventType, ok := streamData["type"].(string); ok {
 						switch eventType {
-							case "message_start":
-								// 不提取 token，所有 token 数据由 message_delta 提供
+						case "message_start":
+							// 不提取 token，所有 token 数据由 message_delta 提供
 						case "message_delta":
 							if usage, ok := streamData["usage"].(map[string]interface{}); ok {
 								if ot, ok := usage["output_tokens"].(float64); ok {
@@ -587,7 +618,7 @@ func handleNonStreamResponse(c *gin.Context, resp *http.Response, provider *conf
 			inputTokens = result.Usage.InputTokens
 			outputTokens = result.Usage.OutputTokens
 			cacheReadTokens = result.Usage.CacheReadInputTokens
-				
+
 		}
 		responseBodyForHistory = string(respBody)
 	}
@@ -694,9 +725,9 @@ func logZeroTokenDebug(providerName, requestID, requestBody, responseBody string
 
 func calculateCost(model string, inputTokens, outputTokens, cacheReadTokens int) float64 {
 	const (
-		inputPricePerToken = 3.0 / 1_000_000       // 输入: 3元/百万
-		cachePricePerToken = 0.025 / 1_000_000      // 缓存读取: 0.025元/百万
-		outputPricePerToken = 6.0 / 1_000_000       // 输出: 6元/百万
+		inputPricePerToken  = 3.0 / 1_000_000   // 输入: 3元/百万
+		cachePricePerToken  = 0.025 / 1_000_000 // 缓存读取: 0.025元/百万
+		outputPricePerToken = 6.0 / 1_000_000   // 输出: 6元/百万
 	)
 	return float64(inputTokens)*inputPricePerToken + float64(cacheReadTokens)*cachePricePerToken + float64(outputTokens)*outputPricePerToken
 }
