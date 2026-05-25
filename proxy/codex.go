@@ -92,6 +92,22 @@ func convertCodexToChat(req map[string]interface{}, provider *config.Provider) m
 					}
 					content := extractResponsesTextContent(itemMap["content"])
 
+
+						// Special handling for system messages when there are pending tool_calls.
+						// OpenAI API requires that tool_calls be resolved by tool messages
+						// before any other message type appears. If we encounter a system
+						// message while there are pending tool_calls, we skip it to avoid
+						// breaking the message sequence required by OpenAI API.
+						if role == "system" && len(messages) > 0 {
+							if last, ok := messages[len(messages)-1].(map[string]interface{}); ok {
+								if last["role"] == "assistant" {
+									if _, hasTC := last["tool_calls"]; hasTC {
+										// Skip this system message to maintain valid message sequence
+										continue
+									}
+								}
+							}
+						}
 					// Merge assistant text into the last assistant message when the
 					// previous item was a function_call (which created an assistant
 					// message with tool_calls). Responses API interleaves function_call
