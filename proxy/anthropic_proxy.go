@@ -151,7 +151,7 @@ func (p *AnthropicProxy) SendAnthropicFormat(ctx context.Context, reqHdr http.He
 		resp.ModelName = modelName
 		return resp
 	}
-	resp := p.sendAnthropicNonStream(ctx, modifiedBody)
+	resp := p.sendAnthropicNonStream(ctx, reqHdr, modifiedBody)
 	resp.ModelName = modelName
 	return resp
 }
@@ -165,7 +165,7 @@ func (p *AnthropicProxy) SendOpenAIFormat(ctx context.Context, reqHdr http.Heade
 		resp.ModelName = modelName
 		return resp
 	}
-	resp := p.sendAnthropicNonStream(ctx, modifiedBody)
+	resp := p.sendAnthropicNonStream(ctx, reqHdr, modifiedBody)
 	resp.ModelName = modelName
 	return resp
 }
@@ -245,8 +245,11 @@ func (p *AnthropicProxy) Provider() *config.Provider {
 // parseAnthropicRequest 解析 Anthropic 格式请求：模型映射 + stream 检查 + 过滤不支持参数
 // 一次 JSON 解析完成所有操作，避免多次 marshal/unmarshal
 // Anthropic → Anthropic：不过滤内容块，thinking 等块保持原样
+//
+// P1 优化：使用 map[string]*json.RawMessage 保留 null 值
 func (p *AnthropicProxy) parseAnthropicRequest(reqBody []byte) ([]byte, string, bool) {
-	var req map[string]interface{}
+	// 使用 *json.RawMessage 保留原始 JSON 值，包括 null
+	var req map[string]*json.RawMessage
 	if err := json.Unmarshal(reqBody, &req); err != nil {
 		return reqBody, "", false
 	}
@@ -261,25 +264,33 @@ func (p *AnthropicProxy) parseAnthropicRequest(reqBody []byte) ([]byte, string, 
 	}
 
 	// 处理模型映射
-	if model, ok := req["model"].(string); ok {
-		modelName = model
-		resolved := p.provider.ResolveModel(model)
-		if resolved != model {
-			logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, p.provider.Name)
-			req["model"] = resolved
-			modelName = resolved
+	if modelRaw, ok := req["model"]; ok {
+		var model string
+		if err := json.Unmarshal(*modelRaw, &model); err == nil {
+			modelName = model
+			resolved := p.provider.ResolveModel(model)
+			if resolved != model {
+				logger.Info("Model resolution: %s → %s (provider: %s)", model, resolved, p.provider.Name)
+				newModelRaw, _ := json.Marshal(resolved)
+				req["model"] = (*json.RawMessage)(&newModelRaw)
+				modelName = resolved
+			}
 		}
 	} else {
 		// model 字段缺失，添加默认模型并记录错误日志
 		defaultModel := p.provider.ResolveModel("default_model")
-		req["model"] = defaultModel
+		defaultModelRaw, _ := json.Marshal(defaultModel)
+		req["model"] = (*json.RawMessage)(&defaultModelRaw)
 		modelName = defaultModel
 		logger.Error("[MissingModel] Request missing 'model' field, added default: %s (provider: %s)", defaultModel, p.provider.Name)
 	}
 
 	// 检查 stream
-	if v, ok := req["stream"].(bool); ok {
-		isStream = v
+	if streamRaw, ok := req["stream"]; ok {
+		var stream bool
+		if err := json.Unmarshal(*streamRaw, &stream); err == nil {
+			isStream = stream
+		}
 	}
 
 	result, _ := json.Marshal(req)
@@ -350,19 +361,34 @@ func (p *AnthropicProxy) parseOpenAIRequest(openaiReq []byte) ([]byte, string, b
 	return result, modelName, isStream
 }
 
-func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqBody []byte) *ProxyResponse {
+func (p *AnthropicProxy) sendAnthropicNonStream(ctx context.Context, reqHdr http.Header, reqBody []byte) *ProxyResponse {
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
 	if err != nil {
 		return &ProxyResponse{Error: fmt.Errorf("create request: %w", err)}
 	}
 
+	// 基础请求头
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
 	req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
-	req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
 	req.Header.Set("x-app", "cli")
-	req.Header.Set("anthropic-version", "2023-06-01")
+
+	// P0 优化：继承客户端的 anthropic-beta，仅在缺失时使用默认值
+	originalBeta := reqHdr.Get("anthropic-beta")
+	if originalBeta != "" {
+		req.Header.Set("anthropic-beta", originalBeta)
+	} else {
+		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+	}
+
+	// P0 优化：继承客户端的 anthropic-version，仅在缺失时使用默认值
+	originalVersion := reqHdr.Get("anthropic-version")
+	if originalVersion != "" {
+		req.Header.Set("anthropic-version", originalVersion)
+	} else {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -397,24 +423,35 @@ func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqHdr http.He
 			return
 		}
 
-		// 设置必要的请求头
+		// P1 优化：将 header 设置移到循环外
+		// 设置必要的请求头（转发客户端的 header，过滤掉敏感头部）
 		for k, v := range reqHdr {
 			for _, val := range v {
 				if strings.ToLower(k) == "authorization" ||
 					strings.ToLower(k) == "content-type" ||
 					strings.ToLower(k) == "user-agent" ||
 					strings.ToLower(k) == "anthropic-beta" ||
-					strings.ToLower(k) == "x-app" {
+					strings.ToLower(k) == "x-app" ||
+					strings.ToLower(k) == "x-api-key" {
 					continue
 				}
 				req.Header.Add(k, val)
 			}
 		}
+
+		// 基础请求头
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
 		req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
-		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
 		req.Header.Set("x-app", "cli")
+
+		// P0 优化：继承客户端的 anthropic-beta，仅在缺失时使用默认值
+		originalBeta := reqHdr.Get("anthropic-beta")
+		if originalBeta != "" {
+			req.Header.Set("anthropic-beta", originalBeta)
+		} else {
+			req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+		}
 
 		resp, err := p.client.Do(req)
 		if err != nil {
@@ -510,6 +547,7 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 }
 
 // handleAnthropicNonStreamingResponse 处理非流式响应
+// P0 优化：继承客户端的 anthropic-beta 和 anthropic-version 头部，仅在缺失时使用默认值
 func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context, c *gin.Context, reqBody []byte, modelName string, startTime time.Time, requestID, method, path, requestBody string) (error, int) {
 	baseURL := p.buildURL()
 	req, err := http.NewRequestWithContext(ctx, "POST", baseURL, bytes.NewReader(reqBody))
@@ -517,12 +555,29 @@ func (p *AnthropicProxy) handleAnthropicNonStreamingResponse(ctx context.Context
 		return fmt.Errorf("create request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
 	}
 
+	// 基础请求头
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
 	req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
-	req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
 	req.Header.Set("x-app", "cli")
-	req.Header.Set("anthropic-version", "2023-06-01")
+
+	// P0 优化：继承客户端的 anthropic-beta，仅在缺失时使用默认值
+	originalBeta := c.GetHeader("anthropic-beta")
+	if originalBeta != "" {
+		req.Header.Set("anthropic-beta", originalBeta)
+	} else {
+		// 默认 beta 标志，包含最常用的功能
+		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+	}
+
+	// P0 优化：继承客户端的 anthropic-version，仅在缺失时使用默认值
+	originalVersion := c.GetHeader("anthropic-version")
+	if originalVersion != "" {
+		req.Header.Set("anthropic-version", originalVersion)
+	} else {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("send request | model:%s provider:%s | %w", modelName, p.provider.Name, err), 0
@@ -594,6 +649,7 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 	}
 
 	// 设置必要的请求头
+	// P1 优化：将 header 设置移到循环外，避免重复设置
 	for k, v := range reqHdr {
 		for _, val := range v {
 			if strings.ToLower(k) == "authorization" ||
@@ -606,12 +662,21 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 			}
 			req.Header.Add(k, val)
 		}
-		req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
-		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
-		req.Header.Set("x-app", "cli")
 	}
+
+	// 基础请求头
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.provider.APIKey)
+	req.Header.Set("User-Agent", "claude-cli/2.1.139 (external, cli)")
+	req.Header.Set("x-app", "cli")
+
+	// P0 优化：继承客户端的 anthropic-beta，仅在缺失时使用默认值
+	originalBeta := c.GetHeader("anthropic-beta")
+	if originalBeta != "" {
+		req.Header.Set("anthropic-beta", originalBeta)
+	} else {
+		req.Header.Set("anthropic-beta", "claude-code-20250219,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24")
+	}
 	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := p.client.Do(req)
