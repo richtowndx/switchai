@@ -1,446 +1,582 @@
-# SwitchAI - Claude API 聚合服务
+# SwitchAI - 智能 API 聚合代理服务
 
-一个本地 Claude API 聚合服务，可以管理多个 Claude API 提供商，并提供统一的接口给 VSCode Claude Code 使用。
+![Go Version](https://img.shields.io/badge/Go-1.21+-blue) ![License](https://img.shields.io/badge/License-MIT-green)
 
-## 功能特性
-
-- 🔄 **多提供商管理**：支持配置多个 Claude API 提供商（不同的 BaseURL 和 API Key）
-- 🤖 **Copilot 提供商**：原生支持 GitHub Copilot Chat API，OAuth 设备码认证，自动 Token 刷新
-- 🎯 **一键切换**：通过 Web 界面快速切换当前使用的提供商
-- 🤖 **多模型配置**：每个提供商可独立配置 default / haiku / sonnet / opus / fast 五类模型
-- 🔄 **格式自动转换**：支持 Anthropic ↔ OpenAI API 格式互转，4 种转换场景全覆盖
-- 🔌 **单提供商代理**：每个提供商可独立配置 HTTP/SOCKS5 代理地址
-- 🔀 **负载均衡**：基于客户端 IP:Port 的 FNV-1a 哈希实现客户端亲和性，确保同一客户端请求路由到同一提供商
-- 🔄 **连接复用**：TCP 连接级别的代理实例复用，减少连接开销
-- 📊 **Token 统计**：实时显示 Token 使用情况（输入/输出/总计）
-- 📜 **请求历史**：记录最近 1000 条请求，支持分页查看和详细内容展示
-- 🔑 **密钥维度统计**：按 API 密钥维度统计请求数、Token 用量和花费
-- ⚖️ **密钥限额控制**：支持每日/总计请求次数限额和花费限额
-- 📝 **日志轮转**：按日期+时间自动轮转日志文件，跨天自动切换
-- 🌐 **Web 管理界面**：简洁美观的管理界面，支持 Copilot OAuth 账号管理
-- 🚀 **透明代理**：自动转发 Claude API 请求到当前选中的提供商
-- 🔐 **2FA 登录**：TOTP 双因素认证，支持多端同时登录
-- 💾 **服务安装**：支持安装为 Windows/Linux 系统服务
-- 🔒 **HTTPS 支持**：内置自签 CA 自动生成 TLS 证书，一键启用 HTTPS
-- 💿 **SQLite 持久化**：配置数据存储于 SQLite 数据库，支持在线 schema 迁移
-
-## 快速开始
+SwitchAI 是一个功能强大的本地 API 聚合代理服务，为 **Claude Code**、**OpenAI SDK**、**Copilot Chat** 等客户端提供统一的 AI 接口网关。支持 **Anthropic**、**OpenAI**、**GitHub Copilot** 等多协议自动适配和智能路由，内置 Web 管理界面、TOTP 双因素认证、密钥配额管理、实时统计监控等企业级特性。
 
 ---
 
-## 界面
+## 📦 特性一览
 
-![主界面](pic/01.png)
+### 🔄 统一网关路由
+| 客户端请求格式 | 支持的路由端点 | 可转发的上游格式 |
+|---------------|---------------|-----------------|
+| Anthropic Messages API | `POST /v1/messages` | Anthropic / OpenAI |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | OpenAI / Anthropic |
+| OpenAI Completions | `POST /v1/completions` | OpenAI / Anthropic |
+| OpenAI Responses API (Codex) | `POST /responses`、`POST /v1/responses` | OpenAI / Anthropic |
+| GitHub Copilot Chat | `POST /chat/completions`、`/copilot/*` | Copilot |
 
-![消耗界面](pic/02.png)
-![日志详细](pic/03.png)
+---
+
+## ✨ 核心功能
+
+### 🏢 多提供商管理
+- 支持 **Anthropic**、**OpenAI**、**GitHub Copilot** 等多种 AI 服务商
+- **基于 FNV-1a 哈希的客户端亲和性路由**：同一客户端 IP:Port 始终路由到同一提供商，维持会话连续性
+- **Round-Robin 轮询**：格式匹配的提供商间自动负载均衡
+- **故障自动切换**：上游返回 5xx/429/529 时自动切换到备用提供商
+- **Web 界面热切换**：一键激活/切换活跃提供商，无需重启服务
+- **5 类模型映射**：每个提供商独立配置 `default`/`haiku`/`sonnet`/`opus`/`fast` 模型映射
+
+### 🔄 智能协议转换
+- **Anthropic ↔ OpenAI 双向自动转换**：请求体、响应体、SSE 流式事件全链路转换
+- **tool_calls ↔ tool_use 转换**：OpenAI function calling 与 Anthropic tool_use 自动互转
+- **tool ↔ tool_result 转换**：工具调用结果格式自动适配
+- **SSE 流式实时转换**：`message_start`/`content_block_delta`/`message_delta` 等事件的实时转换
+- **系统消息智能处理**：自动避免破坏 tool_calls 消息序列
+- **图片格式转换**：Anthropic `image` block ↔ OpenAI `image_url` block
+- **thinking/redacted_thinking 过滤**：Anthropic 专属 block 在转 OpenAI 时自动过滤
+
+### 🛠️ Codex / Responses API 支持
+原生支持 [OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses) 格式：
+- **请求转换**：`instructions`/`input` → Chat Completions `messages`
+- **响应转换**：Chat Completions `choices` → Responses API `output`
+- **流式 SSE 转换**：Chat SSE → Responses API SSE（`response.created`、`response.output_text.delta`、`response.completed` 等事件）
+- **function_call 序列合并**：将 Responses API 交错的 `function_call`/`message` 合并为正确的 Chat 消息序列
+- **函数调用参数增量合并**：跨多个 SSE chunk 的增量拼合
+- **模型智能映射**：`gpt-5.2-codex` → `sonnet_model`、`glm-5` → `haiku_model` 等
+
+### 🅸 GitHub Copilot 集成
+- **OAuth 设备码流程**：Web 界面一键启动 Copilot 认证
+- **GitHub.com 和 GHES 双支持**：支持 GitHub Enterprise Server 私有部署
+- **Token 自动刷新**：过期前 60 秒自动刷新，无需手动干预
+- **多账号管理**：支持添加多个 Copilot 账号，设置默认账号
+- **模型 ID 归一化**：自动处理 `claude-sonnet-4-6[1m]` → `claude-sonnet-4.6` 等格式变换
+- **兼容性回退**：非 Chat 模型（如 Codex 模型）自动回退到 `gpt-4o`
+- **必要 Header 注入**：自动注入 `Editor-Version`、`Copilot-Integration-Id` 等必需头
+
+### 🔐 安全与认证
+- **TOTP 双因素认证**：基于 RFC 6238，兼容 Google/Microsoft Authenticator
+- **API 密钥管理**：生成 `sk-` 开头密钥，支持备注标识、启用/禁用
+- **四维配额控制**：
+  - 每日请求次数限额
+  - 总请求次数限额
+  - 每日花费限额（美元）
+  - 总花费限额（美元）
+- **多端会话**：Cookie 会话管理，支持多端同时登录
+- **内网跳过认证**：`-skip` 参数部署内网环境
+- **HTTPS 支持**：内置自签 CA，自动生成 TLS 证书
+
+### 📊 统计与监控
+- **SQLite 持久化统计**：Provider 维度 + 密钥维度的使用统计
+- **实时数据**：通过 WebSocket 推送实时统计更新
+- **密钥访问审计**：记录每个密钥的请求 IP、Token 用量、花费
+- **日统计聚合**：`key_daily_stats` 表聚合每日数据
+- **首 Token 耗时记录**：`time_to_first_ms` 指标
+- **缓存 Token 统计**：`cache_read_input_tokens` 跟踪提示词缓存效率
+- **零 Token 告警**：自动检测和记录 input/output tokens 为 0 的异常请求
+
+### 📜 请求历史
+- **SQLite 持久化**：存储所有请求/响应记录
+- **分页浏览**：支持页码和每页条数自定义
+- **毫秒级时间戳**：精确到毫秒的时间显示
+- **详情查看**：展示完整请求/响应体
+- **JSON 格式化**：一键格式化 JSON 请求/响应
+- **WebSocket 实时推送**：新记录实时推送到前端
+
+### 🌐 Web 管理界面
+基于 Go embed 嵌入的完整前端页面：
+- **仪表盘**：提供商概览、状态展示
+- **提供商管理**：添加/编辑/删除/测试/激活提供商
+- **模型映射配置**：5 类模型独立配置
+- **代理设置**：每个提供商独立配置 HTTP/SOCKS5 代理
+- **密钥管理**：生成/编辑/限额配置/状态切换
+- **实时统计**：Provider 和密钥维度的使用统计
+- **请求历史**：分页浏览和详情查看
+- **Copilot 认证**：设备码流程、账号管理
+
+### 🔌 连接管理
+- **TCP 连接级代理复用**：同一 TCP 连接复用同一个 CcProxy 实例
+- **连接跟踪**：实时跟踪连接流量（BytesRead/BytesWrite）
+- **空闲清理**：30 秒周期性检查，5 分钟无活动自动清理
+- **并发安全**：基于 `sync.Map` 的并发原语，支持高并发
+- **连接统计**：活动连接数、总连接数、流量统计
+
+### 📋 日志系统
+- **按小时轮转**：日志文件按日期+小时命名
+- **分级日志**：`info`/`error` 分离存储
+- **自动清理**：保留 3 天日志文件，超期自动清理
+- **Gin 中间件集成**：HTTP 请求日志自动记录
+
+---
+
+## 🚀 快速开始
 
 ### 开发模式
 
 ```bash
+# 克隆仓库
+git clone <repository-url>
+cd switchai
+
 # 安装依赖
 go mod tidy
 
-# 直接运行
+# 运行开发服务器（默认端口 7777）
 go run main.go
 
 # 指定端口运行
-go run main.go -port 8080
+go run main.go -p 8080
+
+# 跳过认证（内网开发）
+go run main.go -p 8080 -skip
 ```
 
 ### 生产部署
 
 ```bash
 # 构建所有平台版本
-build.bat
+./build.sh               # Linux/macOS
+./build.bat              # Windows
 
 # 输出文件在 dist/ 目录:
-# - switchai-windows-amd64.exe (web资源已内嵌)
-# - switchai-linux-amd64 (web资源已内嵌)
+#   dist/switchai-windows-amd64.exe
+#   dist/switchai-linux-amd64
+#   dist/switchai-linux-aarch64
+
+# 启动服务
+./switchai-linux-amd64 -p 7777
 ```
 
-**注意**: Web静态资源已通过Go embed打包进二进制文件，无需单独部署web目录。
-
-## 命令行参数
+### 系统服务安装
 
 ```bash
-# 默认端口(7777)启动，首次访问会显示2FA设置页面
-switchai-windows-amd64.exe
-
-# 指定端口启动
-switchai-windows-amd64.exe -p 8080
-
-# 启用 HTTPS（自动生成 TLS 证书，首次运行后位于 .switchai/certs/）
-switchai-windows-amd64.exe -tls
-
-# 指定端口并启用 HTTPS
-switchai-windows-amd64.exe -p 443 -tls
-
-# 安装为系统服务
+# Windows（需要管理员权限）
 switchai-windows-amd64.exe -install
-
-# 安装为系统服务并指定端口
-switchai-windows-amd64.exe -install -p 8080
-
-# 安装为系统服务并启用 HTTPS
-switchai-windows-amd64.exe -install -tls
-
-# 卸载系统服务
-switchai-windows-amd64.exe -uninstall
-
-# 跳过认证模式（内网部署，无需密钥密码）
-switchai-windows-amd64.exe -skip
-
-# 跳过认证并指定端口
-switchai-windows-amd64.exe -p 8080 -skip
-
-# 重置 2FA（清除 TOTP 密钥，访问页面将跳转首次绑定）
-switchai-windows-amd64.exe -reset
-```
-
-**首次启动**: 首次访问时，会显示 2FA 二维码，绑定 authenticator 应用后使用生成的 6 位验证码登录。若忘记密钥，删除配置文件重新运行，或使用 `-reset` 参数重置。
-
-**HTTPS 证书**: 使用 `-tls` 参数启动时，会在 `.switchai/certs/` 目录自动生成自签 CA 根证书 (`ca.pem`) 和服务端证书 (`server.pem`/`server-key.pem`)。将 `ca.pem` 导入系统受信任根证书存储后浏览器不再告警。
-
-**内网部署**: 使用 `-skip` 参数启动时，全程不需要密钥密码即可使用，适合内网部署场景。
-
-## 服务安装
-
-### Windows
-
-服务安装路径: `C:\Program Files\SwitchAI`
-
-```bash
-# 安装服务 (需要管理员权限)
-switchai-windows-amd64.exe -install
-
-# 服务管理命令
 sc start SwitchAI
-sc stop SwitchAI
-sc query SwitchAI
 
-# 卸载服务 (保留数据文件)
-switchai-windows-amd64.exe -uninstall
+# Linux（需要 root 权限）
+sudo ./switchai-linux-amd64 -install
+sudo systemctl start switchai
 ```
 
-**注意**: 卸载服务时会保留配置文件、历史记录和日志文件，只删除二进制程序。
+---
 
-### Linux
+## ⚙️ 配置指南
 
-服务安装路径: `/usr/local/bin`，配置文件: `~/.switchai/`
+### 命令行参数
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `-p` | 监听端口（默认 7777） | `-p 8080` |
+| `-install` | 安装为系统服务 | `-install` |
+| `-uninstall` | 卸载系统服务 | `-uninstall` |
+| `-skip` | 跳过认证（内网模式） | `-skip` |
+| `-reset` | 重置 2FA 认证 | `-reset` |
+| `-tls` | 启用 HTTPS | `-tls` |
+
+### 提供商配置
+
+每个提供商支持：
+
+| 字段 | 说明 | 示例 |
+|------|------|------|
+| `name` | 提供商名称 | `Anthropic Official` |
+| `base_url` | API 基础地址 | `https://api.anthropic.com` |
+| `api_key` | API 密钥 | `sk-ant-...` |
+| `type` | 提供商类型（Anthropic / OpenAI / Copilot） | `anthropic` |
+| `default_model` | 默认模型 | `claude-sonnet-4-6` |
+| `haiku_model` | Haiku 模型 | `claude-haiku-4-5` |
+| `sonnet_model` | Sonnet 模型 | `claude-sonnet-4-6` |
+| `opus_model` | Opus 模型 | `claude-opus-4-7` |
+| `fast_model` | 快速模型 | `claude-haiku-4-5` |
+| `proxy_url` | 代理地址（可选） | `http://127.0.0.1:7890` |
+
+### Copilot 提供商配置
+
+1. 在 Web 界面点击 **Copilot 认证**
+2. 选择 GitHub 部署类型（GitHub.com 或 Enterprise Server）
+3. 输入 Enterprise URL（如适用），点击获取验证码
+4. 在浏览器中打开 `github.com/login/device` 并输入验证码
+5. 授权后在提供商管理中创建 **Copilot** 类型提供商，选择已认证账号
+
+### AI 代理路由映射
+
+```
+客户端 (Anthropic SDK)  →  POST /v1/messages        →  SwitchAI
+客户端 (OpenAI SDK)     →  POST /v1/chat/completions  →  SwitchAI
+客户端 (Responses API)  →  POST /v1/responses         →  SwitchAI
+Claude Code (CLI)       →  POST /v1/messages          →  SwitchAI
+Copilot (VS Code)       →  POST /chat/completions     →  SwitchAI
+```
+
+SwitchAI 自动根据提供商配置决定转发到 **Anthropic API**（`/v1/messages`）还是 **OpenAI API**（`/v1/chat/completions`）。
+
+---
+
+## 📡 API 端点
+
+### Web 管理 API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/login` | TOTP 登录 |
+| `POST` | `/api/logout` | 退出登录 |
+| `GET` | `/api/totp/status` | 获取 TOTP 状态 |
+| `POST` | `/api/totp/setup` | 首次设置 TOTP |
+| `POST` | `/api/totp/verify` | 验证并启用 TOTP |
+| `GET` | `/api/providers` | 获取所有提供商 |
+| `POST` | `/api/providers` | 添加提供商 |
+| `PUT` | `/api/providers/:id` | 更新提供商 |
+| `DELETE` | `/api/providers/:id` | 删除提供商 |
+| `POST` | `/api/providers/:id/activate` | 激活提供商 |
+| `POST` | `/api/providers/:id/test` | 测试提供商连接 |
+| `GET` | `/api/server-keys` | 获取所有密钥 |
+| `POST` | `/api/server-keys` | 添加密钥 |
+| `POST` | `/api/server-keys/generate` | 生成新密钥 |
+| `PUT` | `/api/server-keys/:id` | 更新密钥 |
+| `DELETE` | `/api/server-keys/:id` | 删除密钥 |
+| `GET` | `/api/server-keys/:id/stats` | 获取密钥统计 |
+| `GET` | `/api/stats` | 获取总体统计 |
+| `GET` | `/api/stats/daily` | 获取每日统计 |
+| `POST` | `/api/stats/reset` | 重置所有统计 |
+| `GET` | `/api/history` | 获取请求历史 |
+| `GET` | `/api/history/:id` | 获取请求详情 |
+| `GET` | `/api/ws` | WebSocket 实时统计 |
+| `GET` | `/api/ws/history` | WebSocket 历史推送 |
+
+### Copilot 管理 API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/copilot/device-flow` | 启动 OAuth 设备码流程 |
+| `POST` | `/api/copilot/poll` | 轮询获取 Token |
+| `GET` | `/api/copilot/accounts` | 获取已认证账号 |
+| `DELETE` | `/api/copilot/accounts/:id` | 移除账号 |
+| `POST` | `/api/copilot/accounts/:id/default` | 设置默认账号 |
+| `POST` | `/api/copilot/logout` | 登出所有 Copilot 账号 |
+| `GET` | `/api/copilot/status` | 获取认证状态 |
+
+---
+
+## 🏗️ 项目架构
+
+```
+switchai/
+├── main.go                    # 程序入口，CLI 参数处理、服务启动
+├── go.mod / go.sum            # Go 模块依赖
+├── build.sh / build.bat       # 跨平台构建脚本
+├──
+├── proxy/                     # 代理处理核心
+│   ├── proxy.go              # 主代理逻辑：路由注册、格式转换、流式/非流式处理
+│   ├── ccproxy.go            # CcProxy 接口定义：统一的代理抽象层
+│   ├── ccproxy_handler.go    # Proxy 错误处理、Token 解析、SSE 提取工具
+│   ├── anthropic_proxy.go    # Anthropic 协议代理实现
+│   ├── openai_proxy.go       # OpenAI 协议代理实现
+│   ├── copilot_proxy.go      # Copilot 协议代理实现（SSE 转换）
+│   ├── copilot.go            # Copilot 认证、Token 刷新、模型归一化
+│   ├── codex.go              # Codex/Responses API ↔ Chat Completions 转换
+│   ├── format_helper.go      # 格式转换辅助函数（OpenAI↔Anthropic）
+│   ├── providers.go          # 内置提供商参数过滤规则
+│   ├── conn_proxy_manager.go # 连接级代理管理器（TCP 连接复用）
+│   ├── tracked_conn.go       # 连接跟踪与流量统计
+│   └── session.go            # ConnectionTracker 定义
+├── config/                    # 配置管理
+│   └── config.go             # SQLite 数据模型、CRUD、Provider/Key/Copilot 管理
+├── web/                       # Web 服务和 UI
+│   ├── web.go                # Web API 路由、认证中间件、TOTP 处理
+│   ├── copilot.go            # Copilot OAuth 设备码流程
+│   └── static/               # 前端静态资源（Go embed）
+├── stats/                     # 统计模块
+│   └── stats.go              # SQLite 持久化统计、WebSocket 广播、配额检查
+├── history/                   # 请求历史
+│   └── history.go            # SQLite 存储、WebSocket 推送、分页查询
+├── logger/                    # 日志系统
+│   ├── logger.go             # 分级日志、按小时轮转、自动清理
+│   └── middleware.go         # Gin HTTP 日志中间件
+├── cert/                      # 证书管理
+│   └── cert.go               # 自签 CA 和 TLS 证书生成
+├── service/                   # 系统服务
+│   └── service.go            # Windows 服务 / Linux systemd 安装管理
+├── appdata/                   # 应用数据
+│   └── appdata.go            # 数据目录初始化和路径管理
+└── socktest/                  # 测试工具
+    ├── client/                # TCP 连接测试客户端
+    ├── serv/                  # TCP 测试服务端
+    └── reqformat/             # 请求格式测试
+```
+
+### 关键数据流
+
+```
+┌──────────┐   ┌────────────┐   ┌──────────┐   ┌────────────┐   ┌──────────┐
+│ 客户端    │ → │ 认证中间件   │ → │ 格式检测  │ → │ 提供商选择   │ → │ 格式转换  │
+│(SDK/CLI) │   │(密钥验证/   │   │(Anthropic│   │(哈希路由/   │   │(请求适配) │
+│          │   │ 限额检查)   │   │ OpenAI/  │   │ 轮询/故障  │   │          │
+└──────────┘   └────────────┘   │ Copilot) │   │ 切换)      │   └────┬─────┘
+                                └──────────┘   └────────────┘        │
+                                                                      ▼
+┌──────────┐   ┌────────────┐   ┌──────────┐   ┌────────────┐   ┌──────────┐
+│ 客户端    │ ← │ 响应转换    │ ← │ 上游 API  │ ← │ 请求发送   │ ← │ 模型映射  │
+│(流式转发) │   │(SSE/非流式) │   │(提供商的  │   │(代理/直连) │   │(模型名    │
+│          │   │            │   │ 后端)     │   │            │   │ 解析)     │
+└──────────┘   └────────────┘   └──────────┘   └────────────┘   └──────────┘
+```
+
+---
+
+## 📊 数据存储
+
+### 数据库结构
+
+| 文件 | 用途 | 表 |
+|------|------|----|
+| `config.db` | 配置数据库 | `config`、`providers`、`server_keys`、`copilot_tokens`、`copilot_default_account` |
+| `stats.db` | 统计数据库 | `usage_records`、`provider_stats`、`key_stats`、`key_daily_stats` |
+| `history.db` | 历史数据库 | `request_records` |
+
+### 文件布局
+
+```
+.switchai/
+├── config.db              # 配置数据（提供商、密钥、Copilot Token、会话等）
+├── stats.db               # 统计数据（使用记录、Provider/Key 统计）
+├── history.db             # 请求历史记录
+├── certs/                 # TLS 证书目录
+│   ├── ca.pem            # 自签 CA 根证书
+│   ├── server.pem        # 服务端证书
+│   └── server-key.pem    # 服务端私钥
+└── logs/                  # 日志文件
+    ├── info_2026-05-26_15.log
+    └── error_2026-05-26_15.log
+```
+
+### 模型映射表
+
+| 配置键 | 说明 | 客户端传入示例 |
+|--------|------|---------------|
+| `default_model` | 默认模型（兜底） | `claude-sonnet-4-6` |
+| `haiku_model` | Haiku 模型 | `claude-haiku-4-5` |
+| `sonnet_model` | Sonnet 模型 | `claude-sonnet-4-6` |
+| `opus_model` | Opus 模型 | `claude-opus-4-7` |
+| `fast_model` | 快速模型 | `claude-haiku-4-5` |
+
+客户端传入模型名 → 查表映射 → 兜底 `default_model` → 兼容旧 `model` 字段。
+
+---
+
+## 🧪 测试
 
 ```bash
-# 安装服务 (需要 root 权限)
-sudo ./switchai-linux-amd64 -install
+# 运行所有测试
+go test ./...
 
-# 安装服务并启用 HTTPS
-sudo ./switchai-linux-amd64 -install -tls
+# 代理模块测试
+go test ./proxy/...
 
-# 服务管理命令
-sudo systemctl start switchai
-sudo systemctl stop switchai
-sudo systemctl status switchai
-sudo systemctl enable switchai  # 开机自启
+# 配置模块测试
+go test ./config/...
 
-# 卸载服务 (保留数据文件)
-sudo ./switchai-linux-amd64 -uninstall
+# 格式转换测试
+go test ./proxy/ -run TestFormatConversion
+
+# Codex 转换测试
+go test ./proxy/ -run TestCodexConversion
+
+# 内容块过滤测试
+go test ./proxy/ -run TestFilterUnsupportedContentBlocks
+
+# Copilot 模型归一化测试
+go test ./proxy/ -run TestNormalizeCopilotModelID
 ```
 
-**注意**: 卸载服务时会保留配置文件、历史记录和日志文件，只删除二进制程序和systemd服务文件。
+---
 
-## Web 界面
+## 🛠️ 高级用法
 
-访问地址: `http://localhost:7777`
+### 格式转换示例
 
-### 页面说明
+**OpenAI → Anthropic（请求转换）**
+```json
+// 客户端发送 OpenAI 格式
+POST /v1/chat/completions
+{
+  "model": "gpt-4",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "stream": true
+}
 
-1. **首页** (`/`) - 提供商管理和概览
-2. **Token 统计** (`/log.html`) - 实时 Token 使用统计
-3. **请求历史** (`/history.html`) - 详细的请求/响应历史记录
+// SwitchAI 转换为 Anthropic 格式发送到上游
+POST /v1/messages
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "max_tokens": 4096,
+  "stream": true
+}
+```
 
-### 请求历史功能
+**tool_calls 转换**
+```json
+// OpenAI tool_calls → Anthropic tool_use
+{
+  "role": "assistant",
+  "tool_calls": [{
+    "id": "call_123",
+    "type": "function",
+    "function": {
+      "name": "search",
+      "arguments": "{\"query\":\"test\"}"
+    }
+  }]
+}
 
-- **分页浏览**：最近 1000 条请求，每页 20 条
-- **毫秒级时间戳**：精确到毫秒的时间显示 `2026-03-16 18:51:50.666`
-- **详情查看**：点击"View Details"查看完整请求/响应
-- **JSON 格式化**：一键格式化 JSON 请求/响应体
-- **持久化存储**：所有历史记录保存到 `history.json`
+// 自动转换为
+{
+  "role": "assistant",
+  "content": [{
+    "type": "tool_use",
+    "id": "call_123",
+    "name": "search",
+    "input": {"query": "test"}
+  }]
+}
+```
 
-## 日志系统
+**SSE 流式实时转换**
+```
+# OpenAI SSE 事件流
+原始: data: {"id":"...","choices":[{"delta":{"content":"Hello"}}]}
+转换: event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
 
-### 日志文件
+# Anthropic SSE 事件流
+原始: event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+转换: data: {"id":"...","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+```
 
-日志存储在 `logs/` 目录，按日期时间轮转:
+### 提供商参数过滤
 
-- `info_2026-03-16_18-51-50.log` - 信息日志
-- `error_2026-03-16_18-51-50.log` - 错误日志
+部分第三方 API 不支持某些参数，SwitchAI 自动按 Hostname 过滤：
 
-### 日志轮转
+| 提供商 Hostname | 过滤的参数 |
+|----------------|------------|
+| `api.minimaxi.com` | `output_config` |
+| `api.stepfun.com` | `output_config` |
+| `aigw-gzgy2.cucloud.cn` | `output_config` |
+| 其他 | `output_config`（OpenAI 格式时）|
 
-- **自动轮转**：每天午夜自动切换新日志文件
-- **文件命名**：`info_YYYY-MM-DD_HH-MM-SS.log`
-- **保留策略**：日志永久保留（需手动清理）
+### 内容块过滤
 
-## 配置 VSCode Claude Code
+格式转换时自动过滤不兼容的内容块类型：
+
+| 转换方向 | 过滤的块类型 | 保留的块类型 |
+|---------|-------------|-------------|
+| Anthropic → OpenAI | `thinking`、`redacted_thinking` | `text`、`image_url` |
+| OpenAI → Anthropic | 无 | 全部保留 |
+
+---
+
+## 🔧 故障排查
+
+| 问题 | 可能原因 | 解决方法 |
+|------|---------|---------|
+| 401 Unauthorized | API Key 无效或密钥已禁用 | 检查 Web 界面密钥状态，重新生成 |
+| 403 Forbidden | 超出密钥限额 | 检查 `key_daily_stats`，调整限额或重置 |
+| 上游返回 5xx | 上游服务故障 | 配置备用提供商，启用故障切换 |
+| 格式转换错误 | 请求格式不匹配 | 确认提供商类型与客户端格式匹配 |
+| SSE 流式中断 | 事件边界处理不当 | 检查日志中的 stream 扫描错误 |
+| Copilot 认证失败 | Token 过期或未订阅 | 重新执行设备码流程，检查 Copilot 订阅 |
+| TOTP 验证错误 | 系统时间不同步 | 校准系统时间，检查 NTP 服务 |
+
+```bash
+# 查看实时日志
+tail -f ~/.switchai/logs/info_*.log
+
+# 查看错误日志
+tail -f ~/.switchai/logs/error_*.log
+
+# 搜索特定关键词
+grep "error\|fail\|warn" ~/.switchai/logs/info_*.log
+```
+
+---
+
+## 🔒 VSCode Claude Code 配置
 
 在 VSCode 的 `settings.json` 中配置：
 
 ```json
-"claudeCode.environmentVariables": [
+{
+  "claudeCode.environmentVariables": [
     {
-        "name": "ANTHROPIC_AUTH_TOKEN",
-        "value": "sk-xxxxxxxxx"
+      "name": "ANTHROPIC_AUTH_TOKEN",
+      "value": "sk-xxxxxxxxx"
     },
     {
-        "name": "ANTHROPIC_BASE_URL",
-        "value": "http://localhost:7777"
+      "name": "ANTHROPIC_BASE_URL",
+      "value": "http://localhost:7777"
     },
     {
-        "name": "ANTHROPIC_MODEL",
-        "value": "claude-sonnet-4-6"
+      "name": "ANTHROPIC_MODEL",
+      "value": "claude-sonnet-4-6"
     }
-]
+  ]
+}
 ```
 
-**说明**：
-- `ANTHROPIC_AUTH_TOKEN` 填写在 Web 管理页面生成的 `sk-` 开头的密钥
-- `ANTHROPIC_BASE_URL` 填写服务地址，启用 HTTPS 后改为 `https://localhost:7777`
-- `ANTHROPIC_MODEL` 会自动匹配提供商配置的模型映射表
+- `ANTHROPIC_AUTH_TOKEN`：Web 管理页面生成的 `sk-` 开头密钥
+- `ANTHROPIC_BASE_URL`：SwitchAI 服务地址
+- `ANTHROPIC_MODEL`：会自动匹配提供商配置的模型映射表
 
-## API 端点
+---
 
-### 认证
+## 🔨 构建说明
 
-- `POST /api/login` - TOTP 登录
-- `POST /api/logout` - 退出登录
+### 依赖
 
-### 2FA
+- Go 1.21+
+- GCC/LLVM（SQLite 需要 CGO，但可通过 `modernc.org/sqlite` 实现纯 Go 构建）
 
-- `POST /api/totp/setup` - 首次设置 TOTP
-- `POST /api/totp/verify` - 验证 TOTP
-- `GET /api/totp/status` - 获取 TOTP 状态
+### 构建命令
 
-### 提供商管理
+```bash
+# 本地构建
+go build -o switchai .
 
-- `GET /api/providers` - 获取所有提供商
-- `POST /api/providers` - 添加提供商
-- `PUT /api/providers/:id` - 更新提供商
-- `DELETE /api/providers/:id` - 删除提供商
-- `POST /api/providers/:id/activate` - 激活提供商
-- `POST /api/providers/:id/test` - 测试提供商连接
+# 跨平台构建（Linux amd64 + arm64 + Windows）
+./build.sh
 
-### Copilot OAuth 管理
-
-- `POST /api/copilot/device-flow` - 启动 OAuth 设备码流程
-- `POST /api/copilot/poll` - 轮询获取 Token
-- `GET /api/copilot/accounts` - 获取已认证账号列表
-- `DELETE /api/copilot/accounts/:id` - 移除已认证账号
-- `POST /api/copilot/accounts/:id/default` - 设置默认账号
-- `POST /api/copilot/logout` - 登出所有 Copilot 账号
-- `GET /api/copilot/status` - 获取 Copilot 认证状态
-
-### 服务器密钥管理
-
-- `GET /api/server-keys` - 获取所有服务器密钥
-- `POST /api/server-keys` - 添加服务器密钥
-- `PUT /api/server-keys/:id` - 更新服务器密钥
-- `DELETE /api/server-keys/:id` - 删除服务器密钥
-- `POST /api/server-keys/generate` - 生成新密钥
-- `GET /api/server-keys/:id/stats` - 获取密钥统计
-- `POST /api/server-keys/:id/test` - 测试密钥连接
-
-### 统计信息
-
-- `GET /api/stats` - 获取 Token 统计
-- `GET /api/stats/daily` - 获取每日统计
-- `POST /api/stats/reset` - 重置所有统计
-- `POST /api/stats/reset/:provider_id` - 重置指定提供商统计
-
-### 请求历史
-
-- `GET /api/history?page=1&page_size=20` - 获取分页历史记录
-- `GET /api/history/:id` - 获取详细请求记录
-
-### WebSocket
-
-- `GET /api/ws` - 实时统计更新
-- `GET /api/ws/history` - 实时历史更新
-
-### Claude API 代理路由
-
-| 路由 | 处理器 | 说明 |
-|------|--------|------|
-| `/v1/chat/completions` | openAIHandler | OpenAI 格式请求 |
-| `/v1/completions` | openAIHandler | OpenAI 补全请求 |
-| `/v1/messages` | anthropicHandler | Anthropic/Claude 格式请求 |
-| `/chat/completions` | copilotHandler | Copilot 专用路由 |
-| `/copilot/*path` | copilotHandler | Copilot 代理路径 |
-
-## 数据存储
-
-- `config.db` — 配置数据（SQLite 数据库，包含提供商、服务器密钥、2FA、会话、Copilot Token 等信息）
-  - `providers` — 提供商配置（含 `copilot_base_url`、`proxy_url` 字段）
-  - `copilot_tokens` — Copilot OAuth Token 存储
-  - `copilot_default_account` — 默认 Copilot 账号
-- `history.json` — 请求历史记录（最近 1000 条）
-- `logs/` — 应用日志（按日期时间轮转）
-- `.switchai/certs/` — TLS 证书（HTTPS 模式下自动生成）
-
-## 提供商模型配置
-
-每个提供商支持配置 **5 类模型**，代理根据请求中的 `model` 字段自动匹配：
-
-| 模型键名 | 说明 | 示例 |
-|---------|------|------|
-| `default_model` | 默认模型（兜底） | `claude-sonnet-4-6` |
-| `haiku_model` | Haiku 模型 | `claude-haiku-4-5-20241022` |
-| `sonnet_model` | Sonnet 模型 | `claude-sonnet-4-6` |
-| `opus_model` | Opus 模型 | `claude-opus-4-7-20250514` |
-| `fast_model` | Fast 模型 | `claude-haiku-4-5-20241022` |
-
-模型匹配规则：请求中传入的 model 名称 → 查表找到对应的实际模型名 → 兜底到 `default_model` → 兼容旧 `model` 字段。
-
-## API 格式自动转换
-
-每个提供商可以独立配置 **API 格式**（`is_openai_format`），代理自动处理 4 种转换场景：
-
-| 请求格式 | 提供商格式 | 行为 | 目标 URL |
-|---------|-----------|------|---------|
-| OpenAI | OpenAI | 不转换 | `/chat/completions` |
-| OpenAI | Anthropic | 转换请求体 | `/v1/messages` |
-| Anthropic | OpenAI | 转换请求体 | `/chat/completions` |
-| Anthropic | Anthropic | 不转换 | `/v1/messages` |
-
-- **OpenAI → Anthropic**：OpenAI 格式的 `/v1/chat/completions` 请求自动转为 Anthropic `/v1/messages` 格式
-- **Anthropic → OpenAI**：Anthropic 格式的 `/v1/messages` 请求自动转为 OpenAI `/v1/chat/completions` 格式
-- **SSE 流式转换**：流式响应（Server-Sent Events）实时双向转换，包括 `message_start`/`content_block_delta`/`message_delta` 等事件映射
-
-## 客户端亲和性与负载均衡
-
-基于客户端 IP:Port 计算 FNV-1a 哈希值，同一客户端的所有请求始终路由到同一提供商，减少多提供商切换导致的上下文丢失。
-
-**连接级代理管理**：
-- TCP 连接级别的 CcProxy 实例复用，每个 TCP 连接对应一个代理实例
-- 空闲连接自动清理（默认 5 分钟无活动）
-- 支持连接级别的 Provider 故障切换
-
-**连接跟踪与统计**：
-- 实时跟踪连接流量（BytesRead/BytesWrite）
-- 连接建立/关闭日志记录
-- 按 Provider 分组统计活动连接数
-
-## 服务器密钥管理
-
-支持生成和管理 `sk-` 开头的 API 密钥，每个密钥可配置：
-
-- **备注**：标识密钥归属
-- **启用/禁用**：随时切换密钥状态
-- **每日请求次数限额**：0 表示不限
-- **总请求次数限额**：0 表示不限
-- **每日花费限额 ($)**：0 表示不限
-- **总花费限额 ($)**：0 表示不限
-
-密钥维度的统计信息包括：今日/总请求数、输入/输出/总 Token 数、总花费、访问 IP 列表。
-
-## GitHub Copilot 提供商
-
-支持将 GitHub Copilot Chat API 作为上游提供商，通过 OAuth 设备码流程认证，无需 API Key。
-
-### 认证流程
-
-1. 点击 Web 界面的 **Copilot 认证** 按钮
-2. 选择 GitHub 部署类型（GitHub.com 或 Enterprise Server）
-3. 输入 Enterprise URL（如适用），点击获取验证码
-4. 在浏览器中打开 `github.com/login/device` 并输入验证码
-5. 授权后自动获取 Copilot Token，系统定时自动刷新
-
-### Token 管理
-
-- **自动刷新**：Token 过期前自动重新认证
-- **多账号支持**：可添加多个 GitHub Copilot 账号
-- **默认账号**：设置默认 Copilot 账号用于提供商
-- **一键登出**：清除所有已保存的 Copilot Token
-
-### Copilot 提供商配置
-
-添加提供商时选择 **Copilot 提供商** 类型，选择已认证的 Copilot 账号即可。模型 ID 会自动归一化（dash → dot 格式）。
-
-## 提供商代理设置
-
-每个提供商可独立配置 **HTTP 或 SOCKS5 代理**：
-
-```
-http://127.0.0.1:7890
-socks5://127.0.0.1:1080
+# 构建并注入版本信息
+go build -ldflags="-s -w -X main.versionMajor=1 -X main.versionMinor=0 -X main.versionPatch=0" -o switchai .
 ```
 
-设置后，该提供商的所有请求将通过指定代理转发，未配置代理的提供商直连上游。
+---
 
-## 项目结构
+## 🤝 贡献指南
 
-```
-switchai/
-├── main.go                 # 入口文件，CLI 参数处理
-├── build.bat               # Windows 构建脚本
-├── build.sh                # Linux/macOS 构建脚本
-├── appdata/                # 应用数据目录管理
-├── cert/                   # TLS 证书自动生成（自签 CA + 服务端证书）
-├── config/                 # 配置管理（SQLite 数据库）
-│   └── config.go           # Provider、CopilotToken、ServerKey 等模型与存储
-├── logger/                 # 日志系统（日期轮转）
-├── history/                # 请求历史追踪
-├── proxy/                  # API 代理处理
-│   ├── proxy.go            # 主代理逻辑：格式转换、客户端亲和性、路由注册
-│   ├── copilot.go          # Copilot 协议：Header 注入、Token 管理、模型归一化
-│   ├── ccproxy.go          # Claude Code Proxy 处理（SDK 类型检测、请求适配）
-│   ├── ccproxy_handler.go  # CCProxy HTTP 处理器
-│   ├── anthropic_proxy.go  # Anthropic 原生协议代理
-│   ├── openai_proxy.go     # OpenAI 协议代理
-│   ├── copilot_proxy.go    # Copilot 专用代理（CcProxy 接口实现）
-│   ├── conn_proxy_manager.go # 连接级代理管理（TCP 连接复用）
-│   ├── tracked_conn.go     # 连接跟踪与流量统计
-│   ├── format_helper.go    # 格式转换辅助函数
-│   ├── request_converter.go # 请求格式转换
-│   └── response_converter.go # 响应格式转换
-├── stats/                  # Token 统计
-├── service/                # 服务安装管理
-└── web/                    # Web 服务和 API
-    ├── web.go              # Web API + 静态资源 embed
-    ├── copilot.go          # Copilot OAuth Device Code Flow API
-    └── static/             # HTML/CSS/JS (打包进二进制)
-```
+1. Fork 本仓库
+2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
+3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
+4. 推送到分支 (`git push origin feature/AmazingFeature`)
+5. 开启 Pull Request
 
-**特性**: 使用Go embed将web静态资源打包进二进制文件，单文件部署，无需额外依赖。
+---
 
-## 使用场景
+## 📄 许可证
 
-1. **多账号管理**：管理多个 Claude API 账号，根据需要切换
-2. **Copilot 代理**：使用 GitHub Copilot Chat API 作为上游提供商，OAuth 自动认证
-3. **成本优化**：根据不同提供商的价格和配额灵活切换，密钥维度限额控制预算
-4. **开发测试**：在官方 API 和第三方代理之间快速切换
-5. **请求审计**：记录和审查所有 API 请求/响应
-6. **多端共享**：生成多个 `sk-` 密钥分发给不同客户端，统一管理
-7. **格式适配**：OpenAI 格式的客户端可以无缝访问 Anthropic API，反之亦然
-8. **代理转发**：通过 HTTP/SOCKS5 代理访问上游 API，适配网络受限环境
+本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
 
-## 系统要求
+## 🙏 致谢
 
-- Go 1.21 或更高版本
-- Windows 10+ 或 Linux (systemd)
-- 服务安装需要管理员/root 权限
+- [Gin Web Framework](https://github.com/gin-gonic/gin) - 高性能 Go Web 框架
+- [Gorilla WebSocket](https://github.com/gorilla/websocket) - WebSocket 支持
+- [modernc.org/sqlite](https://modernc.org/sqlite) - 纯 Go SQLite 驱动
+- [Anthropic Claude API](https://www.anthropic.com/) - AI 服务提供商
+- [OpenAI API](https://openai.com/) - AI 服务提供商
+- [GitHub Copilot](https://github.com/features/copilot) - AI 编程助手
+- [Brotli](https://github.com/andybalholm/brotli) - Brotli 压缩支持
 
-## 注意事项
+---
 
-- 配置文件 `config.db` 包含敏感信息（API Key、TOTP Secret、Copilot Token），请勿提交到版本控制
-- 历史记录 `history.json` 可能包含敏感数据，注意保护
-- TLS 证书目录 `.switchai/certs/` 包含私钥，妥善保管
-- 将 `ca.pem` 导入系统受信任根证书存储后浏览器将不再显示安全警告
-- 建议在本地网络环境下使用，不要暴露到公网
-- Token 统计数据仅保存在内存中，重启服务后会清空
-- 请求历史持久化到文件，重启后会自动加载
-- HTTPS 测试模式下使用 `InsecureSkipVerify`，仅推荐开发/内网使用
-- Copilot Token 会自动刷新，登出时清除所有已保存的 Token
-
-## License
-
-MIT
+> **注意**：本工具仅供学习和开发使用，请遵守相关 AI 服务商的使用条款和 API 使用政策。

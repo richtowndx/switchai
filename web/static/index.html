@@ -256,11 +256,11 @@
                     <input type="text" name="name" required placeholder="例如: Anthropic Official">
                 </div>
                 <div class="form-group">
-                    <label>提供商类型</label>
+                    <label>提供商类型 / API 格式</label>
                     <select id="addProviderType" onchange="onAddProviderTypeChange()" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
-                        <option value="anthropic">Anthropic 格式</option>
-                        <option value="openai">OpenAI 格式</option>
-                        <option value="copilot">Copilot 提供商</option>
+                        <option value="anthropic">Anthropic</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="copilot">Copilot</option>
                     </select>
                 </div>
                 <!-- Copilot 专属字段 -->
@@ -309,17 +309,6 @@
                     <input type="text" name="proxy_url" id="addProxyUrl" placeholder="e.g. http://127.0.0.1:7890 或 socks5://... (可选)">
                     <p style="font-size: 12px; color: #666; margin-top: 5px;">设置后，该提供商的请求将通过此代理转发</p>
                 </div>
-                <!-- API 格式选择 (非 Copilot 提供商) -->
-                <div id="addApiFormatSection">
-                    <div class="form-group">
-                        <label>API 格式</label>
-                        <select name="is_openai_format" id="addIsOpenAIFormat" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
-                            <option value="false">Anthropic 格式</option>
-                            <option value="true">OpenAI 格式</option>
-                        </select>
-                        <p style="font-size: 12px; color: #666; margin-top: 5px;">选择该厂商使用的 API 格式</p>
-                    </div>
-                </div>
                 <div style="display: flex; gap: 10px; justify-content: flex-end;">
                     <button type="button" class="btn-danger" onclick="hideAddModal()">取消</button>
                     <button type="submit" class="btn-success">添加</button>
@@ -339,11 +328,11 @@
                     <input type="text" name="name" id="editName" required placeholder="例如: Anthropic Official">
                 </div>
                 <div class="form-group">
-                    <label>提供商类型</label>
+                    <label>提供商类型 / API 格式</label>
                     <select id="editProviderType" onchange="onEditProviderTypeChange()" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
-                        <option value="anthropic">Anthropic 格式</option>
-                        <option value="openai">OpenAI 格式</option>
-                        <option value="copilot">Copilot 提供商</option>
+                        <option value="anthropic">Anthropic</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="copilot">Copilot</option>
                     </select>
                 </div>
                 <!-- Copilot 专属字段 -->
@@ -365,14 +354,6 @@
                     <div class="form-group">
                         <label>API Key</label>
                         <input type="text" name="api_key" id="editApiKey" placeholder="留空则保持不变，输入新值则覆盖">
-                    </div>
-                    <div class="form-group">
-                        <label>API 格式</label>
-                        <select name="is_openai_format" id="editIsOpenAIFormat" style="padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; width: 100%;">
-                            <option value="false">Anthropic 格式</option>
-                            <option value="true">OpenAI 格式</option>
-                        </select>
-                        <p style="font-size: 12px; color: #666; margin-top: 5px;">选择该厂商使用的 API 格式</p>
                     </div>
                 </div>
                 <div class="form-group">
@@ -1240,7 +1221,6 @@
             const isCopilot = type === 'copilot';
             document.getElementById('addCopilotFields').classList.toggle('hidden', !isCopilot);
             document.getElementById('addStandardFields').classList.toggle('hidden', isCopilot);
-            document.getElementById('addApiFormatSection').classList.toggle('hidden', isCopilot);
 
             if (isCopilot) {
                 loadCopilotAccountsIntoSelect('addCopilotAccount');
@@ -1317,7 +1297,6 @@
                 onEditProviderTypeChange();
                 document.getElementById('editBaseUrl').value = provider.base_url;
                 document.getElementById('editApiKey').value = '';
-                document.getElementById('editIsOpenAIFormat').value = provider.is_openai_format ? 'true' : 'false';
             }
 
             document.getElementById('editDefaultModel').value = provider.default_model || provider.model || '';
@@ -1336,9 +1315,9 @@
             const baseUrl = document.getElementById('editBaseUrl').value;
             const apiKey = document.getElementById('editApiKey').value;
             const model = document.getElementById('editDefaultModel').value;
-            const isOpenAIFormat = document.getElementById('editIsOpenAIFormat').value === 'true';
             const providerType = document.getElementById('editProviderType').value;
             const isCopilot = providerType === 'copilot';
+            const isOpenAIFormat = isCopilot || providerType === 'openai';
 
             // Copilot 提供商不需要 baseUrl 和 apiKey，使用 Copilot OAuth 认证
             if (!isCopilot && (!baseUrl || !model)) {
@@ -1484,7 +1463,7 @@
             } else {
                 data.base_url = formData.get('base_url');
                 data.api_key = formData.get('api_key');
-                data.is_openai_format = formData.get('is_openai_format') === 'true';
+                data.is_openai_format = providerType === 'openai';
             }
 
             try {
@@ -1536,7 +1515,7 @@
             } else {
                 data.base_url = formData.get('base_url');
                 data.api_key = formData.get('api_key');
-                data.is_openai_format = formData.get('is_openai_format') === 'true';
+                data.is_openai_format = providerType === 'openai';
             }
 
             try {

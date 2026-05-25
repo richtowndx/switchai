@@ -479,12 +479,24 @@ func handleStreamResponse(c *gin.Context, resp *http.Response, provider *config.
 				responseBody.WriteString("\n")
 			}
 		} else {
-			// 格式匹配，直接转发
-			c.Writer.Write(line)
-			c.Writer.Write([]byte("\n"))
-			flusher.Flush()
-			responseBody.Write(line)
-			responseBody.WriteString("\n")
+			// 格式匹配，直接转发 SSE
+			// 关键：SSE 格式要求每个事件以空行 \n\n 结束
+			// 当遇到空行时，需要添加一个额外的 \n 形成 \n\n
+			if len(line) == 0 {
+				// 空行：已经是事件边界，添加 \n\n
+				// 已经写了空行（无内容），再写一个 \n 就是 \n\n
+				// 空行 + \n = \n\n
+				c.Writer.Write([]byte("\n"))
+				flusher.Flush()
+				responseBody.WriteString("\n")
+			} else {
+				// 非空行
+				c.Writer.Write(line)
+				c.Writer.Write([]byte("\n"))
+				flusher.Flush()
+				responseBody.Write(line)
+				responseBody.WriteString("\n")
+			}
 		}
 
 		// 提取 token 统计（所有格式通用）

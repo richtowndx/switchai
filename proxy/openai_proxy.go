@@ -297,6 +297,8 @@ func (p *OpenAIProxy) sendOpenAIStream(ctx context.Context, reqBody []byte) *Pro
 		for scanner.Scan() {
 			line := scanner.Text()
 			if line == "" {
+				// 空行：SSE 事件边界，需要发送 \n\n
+				// 空行 + \n = \n\n
 				ch <- "\n"
 			} else {
 				ch <- line + "\n"
@@ -656,8 +658,13 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 			*firstTokenTime = time.Now()
 		}
 
+		// 转发 SSE 行
 		c.Writer.WriteString(line)
 		if line != "" {
+			// 非空行：添加换行符
+			c.Writer.WriteString("\n")
+		} else {
+			// 空行：SSE 事件边界，需要添加 \n 形成 \n\n
 			c.Writer.WriteString("\n")
 		}
 		flusher.Flush()
@@ -666,6 +673,8 @@ func (p *OpenAIProxy) handleOpenAIStreamingResponse(ctx context.Context, c *gin.
 		if responseBody.Len() < 100*1024 { // 限制 100KB
 			responseBody.WriteString(line)
 			if line != "" {
+				responseBody.WriteString("\n")
+			} else {
 				responseBody.WriteString("\n")
 			}
 		}

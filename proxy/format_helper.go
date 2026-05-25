@@ -528,9 +528,9 @@ func parseJSONToMap(jsonStr interface{}) map[string]interface{} {
 // 输入：OpenAI 格式的 SSE 行（如 "data: {"id":"...","choices":[...]}"）
 // 输出：Anthropic 格式的 SSE 行（如 "event: content_block_delta\ndata: {...}"）
 func convertOpenAIStreamLineToAnthropic(line string) string {
-	// 空行直接返回
+	// 空行：SSE 事件边界，需要返回 \n\n
 	if line == "" || line == "\n" {
-		return line
+		return "\n"
 	}
 
 	// 不以 "data: " 开头的行直接返回

@@ -376,7 +376,7 @@
                         <td><span class="log-link" onclick="showKeyDetail('${record.key_id}')">${getKeyRemark(record.key_id)}</span></td>
                         <td>${record.provider || '-'}</td>
                         <td>${record.model || '-'}</td>
-                        <td><span class="badge ${record.path && record.path.includes('/v1/chat') ? 'badge-stream' : 'badge-non-stream'}">${record.path && record.path.includes('/v1/chat') ? 'OpenAI' : 'Anthropic'}</span></td>
+                        <td><span class="badge ${getApiStyle(record.path)}">${getApiType(record.path)}</span></td>
                         <td>${formatToken(record.input_tokens || 0)}</td>
                         <td>${formatToken(record.output_tokens || 0)}</td>
                         <td>${formatToken(record.cache_read_input_tokens || 0)}</td>
@@ -389,6 +389,15 @@
             } else {
                 recordsTable.innerHTML = '<tr><td colspan="13" style="text-align: center; color: #999; padding: 20px;">暂无记录</td></tr>';
             }
+        }
+
+        function getApiType(path) {
+            // Anthropic API 只有 /v1/messages，其余均为 OpenAI 格式
+            return path && path.includes('/v1/messages') ? 'Anthropic' : 'OpenAI';
+        }
+
+        function getApiStyle(path) {
+            return path && path.includes('/v1/messages') ? 'badge-non-stream' : 'badge-stream';
         }
 
         function updatePagination() {
@@ -734,7 +743,7 @@
                 <td><span class="log-link" onclick="showKeyDetail('${record.key_id}')">${getKeyRemark(record.key_id)}</span></td>
                 <td>${record.provider || '-'}</td>
                 <td>${record.model || '-'}</td>
-                <td><span class="badge ${record.path && record.path.includes('/v1/chat') ? 'badge-stream' : 'badge-non-stream'}">${record.path && record.path.includes('/v1/chat') ? 'OpenAI' : 'Anthropic'}</span></td>
+                <td><span class="badge ${getApiStyle(record.path)}">${getApiType(record.path)}</span></td>
                 <td>${formatToken(record.input_tokens || 0)}</td>
                 <td>${formatToken(record.output_tokens || 0)}</td>
                 <td>${formatToken(record.cache_read_input_tokens || 0)}</td>

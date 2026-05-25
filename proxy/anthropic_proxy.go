@@ -457,6 +457,8 @@ func (p *AnthropicProxy) sendAnthropicStream(ctx context.Context, reqHdr http.He
 		for scanner.Scan() {
 			line := scanner.Text()
 			if line == "" {
+				// 空行：SSE 事件边界，需要发送 \n\n
+				// 空行 + \n = \n\n
 				ch <- "\n"
 			} else {
 				ch <- line + "\n"
@@ -665,8 +667,14 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 			*firstTokenTime = time.Now()
 		}
 
+		// 转发 SSE 行
 		c.Writer.WriteString(line)
 		if line != "" {
+			// 非空行：添加换行符
+			c.Writer.WriteString("\n")
+		} else {
+			// 空行：SSE 事件边界，需要添加 \n 形成 \n\n
+			// 写一个 \n，与前面的 \n 一起形成 \n\n
 			c.Writer.WriteString("\n")
 		}
 		flusher.Flush()
@@ -675,6 +683,8 @@ func (p *AnthropicProxy) handleAnthropicStreamingResponse(ctx context.Context, c
 		if responseBody.Len() < 100*1024 { // 限制 100KB
 			responseBody.WriteString(line)
 			if line != "" {
+				responseBody.WriteString("\n")
+			} else {
 				responseBody.WriteString("\n")
 			}
 		}
